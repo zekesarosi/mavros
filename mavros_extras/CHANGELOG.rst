@@ -2,6 +2,29 @@
 Changelog for package mavros_extras
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+2.12.0 (2025-09-14)
+-------------------
+* cmake: explicit link diagnostic_msgs
+  Fix `#2062 <https://github.com/mavlink/mavros/issues/2062>`_
+* include: add common qos profile for latched state topics
+* uncrustify to kilted
+* DDS equivalent of latched topic for gp_origin topic
+* code style fix
+* fix: yaml_cpp_vendor linking in mavros_extras
+* Contributors: ArielSulton, Bruno Celaries, Vladimir Ermakov
+
+2.11.0 (2025-09-10)
+-------------------
+* extras: cmake: fix absent link to libmavros.so
+* extras: fake_gps: fix warnings on geo alt conversion
+* breaking: support mavlink 2025.9.9 move of AUTOPILOT_VERSION to standard
+* extras: no need for yaml-cpp-vendor
+* uas: fix old tf2 headers include
+* cmake: disable uncrustify for humble
+* cmake: update for kilted+, possibly break humble
+* regenerate all and uncrustify
+* Contributors: Vladimir Ermakov
+
 2.10.1 (2025-06-06)
 -------------------
 * Initialize last_pos_time with RCL_ROS_TIME

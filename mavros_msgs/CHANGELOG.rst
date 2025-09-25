@@ -2,6 +2,14 @@
 Changelog for package mavros_msgs
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
+2.12.0 (2025-09-14)
+-------------------
+
+2.11.0 (2025-09-10)
+-------------------
+* regenerate all and uncrustify
+* Contributors: Vladimir Ermakov
+
 2.10.1 (2025-06-06)
 -------------------
 
