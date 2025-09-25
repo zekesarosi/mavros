@@ -19,7 +19,7 @@
  #include "mavros/plugin.hpp"
  #include "mavros/plugin_filter.hpp"
  
- #include "custom_mavros_msgs/msg/obstacle3_d.hpp" // Our custom message
+  #include "mavros_msgs/msg/obstacle3_d.hpp"
  
  namespace mavros
  {
@@ -31,7 +31,7 @@
   * @brief Plugin to handle sending OBSTACLE_DISTANCE_3D MAVLink messages.
   * @plugin obstacle_distance_3d
   *
-  * Subscribes to a custom_mavros_msgs/Obstacle3D message and sends the
+   * Subscribes to a mavros_msgs/Obstacle3D message and sends the
   * data to the flight controller to report the position of a single obstacle.
   */
  class Obstacle3DPlugin : public plugin::Plugin
@@ -49,7 +49,7 @@
                  frame = utils::mav_frame_from_str(mav_frame_str);
              });
  
-         obstacle_sub_ = node->create_subscription<custom_mavros_msgs::msg::Obstacle3D>(
+          obstacle_sub_ = node->create_subscription<mavros_msgs::msg::Obstacle3D>(
              "~/send", 10, std::bind(&Obstacle3DPlugin::obstacle_cb, this, _1));
      }
  
@@ -59,7 +59,7 @@
      }
  
  private:
-     rclcpp::Subscription<custom_mavros_msgs::msg::Obstacle3D>::SharedPtr obstacle_sub_;
+      rclcpp::Subscription<mavros_msgs::msg::Obstacle3D>::SharedPtr obstacle_sub_;
  
      mavlink::common::MAV_FRAME frame;
  
@@ -69,7 +69,7 @@
       * Message specification: https://mavlink.io/en/messages/common.html#OBSTACLE_DISTANCE_3D
       * @param msg  The received Obstacle3D message.
       */
-     void obstacle_cb(const custom_mavros_msgs::msg::Obstacle3D::SharedPtr msg)
+      void obstacle_cb(const mavros_msgs::msg::Obstacle3D::SharedPtr msg)
      {
          // --- Data Validation ---
          // Check for invalid floating point numbers before sending.
@@ -92,7 +92,7 @@
          // Use the frame from the parameter, but allow the message to override it
          // This logic can be adjusted based on desired behavior.
          if (msg->frame > 0) {
-             obstacle.frame = msg->frame;
+             obstacle.frame = msg->frame; // NOTE: Ardupilot currently only supports the FRD frame
          } else {
              obstacle.frame = utils::enum_value(frame);
          }
