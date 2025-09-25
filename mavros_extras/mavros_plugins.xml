@@ -144,6 +144,17 @@ Publishes obstacle distance array to the FCU, in order to assist in an obstacle
 avoidance flight.
 @see obstacle_cb()</description>
   </class>
+
+  <class name="obstacle_distance_3d" type="mavros::plugin::PluginFactoryTemplate&lt;mavros::extra_plugins::Obstacle3DPlugin&gt;" base_class_type="mavros::plugin::PluginFactory">
+    <description>@brief Obstacle Distance 3D plugin
+@plugin obstacle_distance_3d
+
+Subscribes to a custom ROS 2 message and sends OBSTACLE_DISTANCE_3D
+MAVLink messages to the flight controller.
+    </description>
+  </class>
+
+
   <class name="odometry" type="mavros::plugin::PluginFactoryTemplate&lt;mavros::extra_plugins::OdometryPlugin&gt;" base_class_type="mavros::plugin::PluginFactory">
     <description>@brief Odometry plugin
 @plugin odometry

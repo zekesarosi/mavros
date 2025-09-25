@@ -34,6 +34,9 @@ find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(yaml_cpp_vendor REQUIRED)
 
+find_package(custom_mavros_msgs REQUIRED)
+
+
 ## Find GeographicLib
 # Append to CMAKE_MODULE_PATH since debian/ubuntu installs
 # FindGeographicLib.cmake in a nonstand location
@@ -114,6 +117,7 @@ add_library(mavros_extras_plugins SHARED
   src/plugins/mag_calibration_status.cpp
   src/plugins/mocap_pose_estimate.cpp
   src/plugins/mount_control.cpp
+  src/plugins/obstacle_distance_3d.cpp
   src/plugins/obstacle_distance.cpp
   src/plugins/odom.cpp
   src/plugins/onboard_computer_status.cpp
@@ -138,6 +142,7 @@ ament_target_dependencies(mavros_extras_plugins
   geographic_msgs
   mavros
   mavros_msgs
+  custom_mavros_msgs
   std_msgs
   std_srvs
   sensor_msgs
