@@ -6,6 +6,9 @@
 
 std_msgs/Header header
 
+# Timestamp (time since system boot)
+uint32 time_boot_ms
+
 # MAV_DISTANCE_SENSOR enum
 uint8 sensor_type
 
@@ -16,9 +19,7 @@ uint8 frame
 uint16 obstacle_id
 
 # Obstacle position in meters
-float32 x
-float32 y
-float32 z
+geometry_msgs/Point position
 
 # Sensor range in meters
 float32 min_distance

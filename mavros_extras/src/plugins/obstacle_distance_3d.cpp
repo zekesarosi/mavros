@@ -1,6 +1,6 @@
 /**
  * @brief Obstacle Distance 3D plugin
- * @file obstacle_3d.cpp
+ * @file obstacle_distance_3d.cpp
  * @author Zeke Sarosi
  *
  * @addtogroup plugin
@@ -19,7 +19,7 @@
  #include "mavros/plugin.hpp"
  #include "mavros/plugin_filter.hpp"
  
-  #include "mavros_msgs/msg/obstacle3_d.hpp"
+  #include "mavros_msgs/msg/obstacle_distance3_d.hpp"
  
  namespace mavros
  {
@@ -28,17 +28,17 @@
  using namespace std::placeholders;
  
  /**
-  * @brief Plugin to handle sending OBSTACLE_DISTANCE_3D MAVLink messages.
-  * @plugin obstacle_distance_3d
-  *
-   * Subscribes to a mavros_msgs/Obstacle3D message and sends the
-  * data to the flight controller to report the position of a single obstacle.
+ * @brief Plugin to handle sending OBSTACLE_DISTANCE_3D MAVLink messages.
+ * @plugin obstacle_distance_3d
+ *
+  * Subscribes to a mavros_msgs/ObstacleDistance3D message and sends the
+ * data to the flight controller to report the position of a single obstacle.
   */
- class Obstacle3DPlugin : public plugin::Plugin
+ class ObstacleDistance3DPlugin : public plugin::Plugin
  {
  public:
-     explicit Obstacle3DPlugin(plugin::UASPtr uas_)
-     : Plugin(uas_, "obstacle_distance_3d")
+    explicit ObstacleDistance3DPlugin(plugin::UASPtr uas_)
+    : Plugin(uas_, "obstacle_distance_3d")
      {
          enable_node_watch_parameters();
  
@@ -49,8 +49,8 @@
                  frame = utils::mav_frame_from_str(mav_frame_str);
              });
  
-          obstacle_sub_ = node->create_subscription<mavros_msgs::msg::Obstacle3D>(
-             "~/send", 10, std::bind(&Obstacle3DPlugin::obstacle_cb, this, _1));
+         obstacle_sub_ = node->create_subscription<mavros_msgs::msg::ObstacleDistance3D>(
+            "~/send", 10, std::bind(&ObstacleDistance3DPlugin::obstacle_cb, this, _1));
      }
  
      Subscriptions get_subscriptions() override
@@ -59,35 +59,36 @@
      }
  
  private:
-      rclcpp::Subscription<mavros_msgs::msg::Obstacle3D>::SharedPtr obstacle_sub_;
+      rclcpp::Subscription<mavros_msgs::msg::ObstacleDistance3D>::SharedPtr obstacle_sub_;
  
      mavlink::common::MAV_FRAME frame;
  
      /**
       * @brief Callback for incoming obstacle data. Converts and sends to FCU.
       *
-      * Message specification: https://mavlink.io/en/messages/common.html#OBSTACLE_DISTANCE_3D
-      * @param msg  The received Obstacle3D message.
-      */
-      void obstacle_cb(const mavros_msgs::msg::Obstacle3D::SharedPtr msg)
+      * Message specification: https://mavlink.io/en/messages/ardupilotmega.html#OBSTACLE_DISTANCE_3D
+     * @param msg  The received ObstacleDistance3D message.
+     */
+      void obstacle_cb(const mavros_msgs::msg::ObstacleDistance3D::SharedPtr msg)
      {
-         // --- Data Validation ---
-         // Check for invalid floating point numbers before sending.
-         if (std::isnan(msg->x) || std::isnan(msg->y) || std::isnan(msg->z)) {
-             RCLCPP_WARN(get_logger(), "obstacle_3d: Rejecting message with NaN coordinates.");
-             return;
-         }
+        // --- Data Validation ---
+        // Check for invalid floating point numbers before sending.
+        if (std::isnan(msg->position.x) || std::isnan(msg->position.y) || std::isnan(msg->position.z)) {
+            RCLCPP_WARN(get_logger(), "obstacle_3d: Rejecting message with NaN coordinates.");
+            return;
+        }
  
-         mavlink::ardupilotmega::msg::OBSTACLE_DISTANCE_3D obstacle{};
- 
-         // --- Field Mapping ---
-         obstacle.sensor_type = msg->sensor_type;
-         obstacle.obstacle_id = msg->obstacle_id;
-         obstacle.x = msg->x;
-         obstacle.y = msg->y;
-         obstacle.z = msg->z;
-         obstacle.min_distance = msg->min_distance;
-         obstacle.max_distance = msg->max_distance;
+        mavlink::ardupilotmega::msg::OBSTACLE_DISTANCE_3D obstacle{};
+
+        // --- Field Mapping ---
+        obstacle.time_boot_ms = get_time_boot_ms();
+        obstacle.sensor_type = msg->sensor_type;
+        obstacle.obstacle_id = msg->obstacle_id;
+        obstacle.x = msg->position.x;
+        obstacle.y = msg->position.y;
+        obstacle.z = msg->position.z;
+        obstacle.min_distance = msg->min_distance;
+        obstacle.max_distance = msg->max_distance;
  
          // Use the frame from the parameter, but allow the message to override it
          // This logic can be adjusted based on desired behavior.
@@ -109,5 +110,5 @@
  }	// namespace mavros
  
  #include <mavros/mavros_plugin_register_macro.hpp>
- MAVROS_PLUGIN_REGISTER(mavros::extra_plugins::Obstacle3DPlugin)
+ MAVROS_PLUGIN_REGISTER(mavros::extra_plugins::ObstacleDistance3DPlugin)
  
