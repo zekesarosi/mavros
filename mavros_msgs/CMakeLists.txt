@@ -111,7 +111,7 @@ set(msg_files
   msg/WaypointList.msg
   msg/WaypointReached.msg
   msg/WheelOdomStamped.msg
-  # [[[end]]] (sum: bFKUHBtdCu)
+  # [[[end]]] (sum: 4tpSf/CPJJ)
 )
 
 set(srv_files

@@ -123,8 +123,8 @@ add_library(mavros_extras_plugins SHARED
   src/plugins/mag_calibration_status.cpp
   src/plugins/mocap_pose_estimate.cpp
   src/plugins/mount_control.cpp
-  src/plugins/obstacle_distance_3d.cpp
   src/plugins/obstacle_distance.cpp
+  src/plugins/obstacle_distance_3d.cpp
   src/plugins/odom.cpp
   src/plugins/onboard_computer_status.cpp
   src/plugins/open_drone_id.cpp
@@ -140,7 +140,7 @@ add_library(mavros_extras_plugins SHARED
   src/plugins/vision_pose_estimate.cpp
   src/plugins/vision_speed_estimate.cpp
   src/plugins/wheel_odometry.cpp
-  # [[[end]]] (sum: RWTZIs+j02)
+  # [[[end]]] (sum: U88gu4eT+J)
 )
 target_link_libraries(mavros_extras_plugins PUBLIC
   ${geographic_msgs_TARGETS}
