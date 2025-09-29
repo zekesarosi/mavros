@@ -81,7 +81,7 @@
         mavlink::ardupilotmega::msg::OBSTACLE_DISTANCE_3D obstacle{};
 
         // --- Field Mapping ---
-        obstacle.time_boot_ms = get_time_boot_ms();
+        obstacle.time_boot_ms = get_time_boot_ms(msg->header.stamp);
         obstacle.sensor_type = msg->sensor_type;
         obstacle.obstacle_id = msg->obstacle_id;
         obstacle.x = msg->position.x;
@@ -98,7 +98,7 @@
              obstacle.frame = utils::enum_value(frame);
          }
  
-        RCLCPP_INFO(
+        RCLCPP_DEBUG(
             get_logger(),
             "OBSTACLE_3D: id: %u, frame: %u, x: %.3f, y: %.3f, z: %.3f",
             obstacle.obstacle_id, obstacle.frame, obstacle.x, obstacle.y, obstacle.z);

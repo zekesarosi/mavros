@@ -6,9 +6,6 @@
 
 std_msgs/Header header
 
-# Timestamp (time since system boot)
-uint32 time_boot_ms
-
 # MAV_DISTANCE_SENSOR enum
 uint8 sensor_type
 
