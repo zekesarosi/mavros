@@ -13,7 +13,7 @@
  * in the top-level LICENSE file of the MAVROS repository.
  */
 
- #include <cmath> // For std::isnan
+ #include <cmath>
 
  #include "mavros/mavros_uas.hpp"
  #include "mavros/plugin.hpp"
