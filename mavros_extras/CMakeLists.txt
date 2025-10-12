@@ -132,6 +132,7 @@ add_library(mavros_extras_plugins SHARED
   src/plugins/play_tune.cpp
   src/plugins/px4flow.cpp
   src/plugins/rangefinder.cpp
+  src/plugins/sim_state.cpp
   src/plugins/terrain.cpp
   src/plugins/trajectory.cpp
   src/plugins/tunnel.cpp
@@ -140,7 +141,7 @@ add_library(mavros_extras_plugins SHARED
   src/plugins/vision_pose_estimate.cpp
   src/plugins/vision_speed_estimate.cpp
   src/plugins/wheel_odometry.cpp
-  # [[[end]]] (sum: U88gu4eT+J)
+  # [[[end]]] (sum: E3zv4+Yl1z)
 )
 target_link_libraries(mavros_extras_plugins PUBLIC
   ${geographic_msgs_TARGETS}
