@@ -30,7 +30,7 @@ namespace mavros
 {
 namespace extra_plugins
 {
-using namespace std::placeholders;      // NOLINT
+using namespace std::placeholders;      
 
 /**
  * @brief SIM_STATE plugin.
@@ -42,11 +42,16 @@ public:
   explicit SimStatePlugin(plugin::UASPtr uas_)
   : Plugin(uas_, "sim_state")
   {
-    attitude_pub = node->create_publisher<sensor_msgs::msg::Imu>("~/attitude", 10);
-    acceleration_pub = node->create_publisher<geometry_msgs::msg::Vector3Stamped>("~/acceleration", 10);
-    velocity_body_pub = node->create_publisher<geometry_msgs::msg::TwistStamped>("~/velocity_body", 10);
-    velocity_local_pub = node->create_publisher<geometry_msgs::msg::TwistStamped>("~/velocity_local", 10);
-    global_position_pub = node->create_publisher<sensor_msgs::msg::NavSatFix>("~/global_position", 10);
+    attitude_pub = node->create_publisher<sensor_msgs::msg::Imu>(
+      "~/attitude", 10);
+    acceleration_pub = node->create_publisher<geometry_msgs::msg::Vector3Stamped>(
+      "~/acceleration", 10);
+    velocity_body_pub = node->create_publisher<geometry_msgs::msg::TwistStamped>(
+      "~/velocity_body", 10);
+    velocity_local_pub = node->create_publisher<geometry_msgs::msg::TwistStamped>(
+      "~/velocity_local", 10);
+    global_position_pub = node->create_publisher<sensor_msgs::msg::NavSatFix>(
+      "~/global_position", 10);
   }
 
   Subscriptions get_subscriptions() override
@@ -75,7 +80,8 @@ private:
     imu_msg.header.stamp = stamp;
     imu_msg.header.frame_id = "base_link";
     // SIM_STATE quaternion ordering: q1=w, q2=x, q3=y, q4=z (aircraft->NED)
-    auto ned_aircraft_orientation = Eigen::Quaterniond(sim_state.q1, sim_state.q2, sim_state.q3, sim_state.q4);
+    auto ned_aircraft_orientation = Eigen::Quaterniond(
+      sim_state.q1, sim_state.q2, sim_state.q3, sim_state.q4);
     auto enu_baselink_orientation = mavros::ftf::transform_orientation_aircraft_baselink(
       mavros::ftf::transform_orientation_ned_enu(ned_aircraft_orientation));
     imu_msg.orientation = tf2::toMsg(enu_baselink_orientation);
@@ -100,12 +106,11 @@ private:
     tf2::toMsg(acc_enu, accel_msg.vector);
     acceleration_pub->publish(accel_msg);
 
-    // (No separate Euler topic: attitude quaternion already provided)
-
     // Compute velocities: NED -> ENU and ENU -> base_link
     auto vel_ned = Eigen::Vector3d(sim_state.vn, sim_state.ve, sim_state.vd);
     auto vel_enu = mavros::ftf::transform_frame_ned_enu(vel_ned);
-    auto baselink_linear = mavros::ftf::transform_frame_enu_baselink(vel_enu, enu_baselink_orientation.inverse());
+    auto baselink_linear = mavros::ftf::transform_frame_enu_baselink(
+      vel_enu, enu_baselink_orientation.inverse());
 
     // Publish body velocity (base_link)
     auto twist_body = geometry_msgs::msg::TwistStamped();
@@ -120,7 +125,8 @@ private:
     twist_local.header.stamp = stamp;
     twist_local.header.frame_id = "map";
     tf2::toMsg(vel_enu, twist_local.twist.linear);
-    auto enu_angular = mavros::ftf::transform_frame_baselink_enu(gyro_flu, enu_baselink_orientation);
+    auto enu_angular = mavros::ftf::transform_frame_baselink_enu(
+      gyro_flu, enu_baselink_orientation);
     tf2::toMsg(enu_angular, twist_local.twist.angular);
     velocity_local_pub->publish(twist_local);
 
@@ -158,9 +164,11 @@ private:
       fix_msg.position_covariance[0] = var_h;
       fix_msg.position_covariance[4] = var_h;
       fix_msg.position_covariance[8] = var_v;
-      fix_msg.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
+      fix_msg.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_DIAGONAL_KNOWN;
     } else {
-      fix_msg.position_covariance_type = sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
+      fix_msg.position_covariance_type =
+        sensor_msgs::msg::NavSatFix::COVARIANCE_TYPE_UNKNOWN;
     }
 
     global_position_pub->publish(fix_msg);
