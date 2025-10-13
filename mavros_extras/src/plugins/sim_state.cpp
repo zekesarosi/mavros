@@ -8,7 +8,7 @@
  */
 /*
  * Copyright 2025 Zeke Sarosi
- * 
+ *
  * This file is part of the MAVROS package and subject to the license terms
  * in the top-level LICENSE file of the MAVROS repository.
  */
@@ -30,7 +30,7 @@ namespace mavros
 {
 namespace extra_plugins
 {
-using namespace std::placeholders;      
+using namespace std::placeholders;
 
 /**
  * @brief SIM_STATE plugin.
@@ -174,12 +174,10 @@ private:
     global_position_pub->publish(fix_msg);
   }
 };
-}       // namespace extra_plugins
-}       // namespace mavros
+}  // namespace extra_plugins
+}  // namespace mavros
 
 #include <mavros/mavros_plugin_register_macro.hpp>  // NOLINT
 MAVROS_PLUGIN_REGISTER(mavros::extra_plugins::SimStatePlugin)
 
 /** @} */
-
-
