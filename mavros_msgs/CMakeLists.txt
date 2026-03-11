@@ -162,6 +162,7 @@ set(srv_files
   srv/SetMode.srv
   srv/StreamRate.srv
   srv/TerrainCheck.srv
+  srv/TerrainGridCheck.srv
   srv/VehicleInfoGet.srv
   srv/WaypointClear.srv
   srv/WaypointPull.srv

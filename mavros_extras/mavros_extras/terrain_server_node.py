@@ -10,7 +10,10 @@ Also provides a service for point elevation queries.
 from __future__ import annotations
 
 from collections import deque
+import math
 import threading
+
+import numpy as np
 
 from mavros_extras.srtm import (
     compute_terrain_data_block,
@@ -19,7 +22,7 @@ from mavros_extras.srtm import (
     SrtmManager,
 )
 from mavros_msgs.msg import TerrainData, TerrainRequest
-from mavros_msgs.srv import TerrainCheck
+from mavros_msgs.srv import TerrainCheck, TerrainGridCheck
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
@@ -99,6 +102,12 @@ class TerrainServerNode(Node):
             self._on_check,
         )
 
+        self.create_service(
+            TerrainGridCheck,
+            '/mavros/terrain/grid_check',
+            self._on_grid_check,
+        )
+
         period = 1.0 / rate_hz
         self._timer = self.create_timer(period, self._on_send_tick)
 
@@ -152,6 +161,50 @@ class TerrainServerNode(Node):
         else:
             response.success = True
             response.terrain_height = float(elev)
+        return response
+
+    def _on_grid_check(
+        self,
+        request: TerrainGridCheck.Request,
+        response: TerrainGridCheck.Response,
+    ) -> TerrainGridCheck.Response:
+        res_deg = request.resolution_deg
+        if res_deg <= 0.0:
+            response.success = False
+            return response
+
+        rows = int(math.ceil((request.max_latitude - request.min_latitude) / res_deg)) + 1
+        cols = int(math.ceil((request.max_longitude - request.min_longitude) / res_deg)) + 1
+
+        max_cells = 50000
+        if rows * cols > max_cells:
+            self.get_logger().warn(
+                f'Grid check too large: {rows}x{cols}={rows * cols} > {max_cells}'
+            )
+            response.success = False
+            return response
+
+        elevations = np.full(rows * cols, float('nan'), dtype=np.float32)
+        filled = 0
+        for r in range(rows):
+            lat = request.min_latitude + r * res_deg
+            for c in range(cols):
+                lon = request.min_longitude + c * res_deg
+                elev = self._mgr.lookup_elevation(lat, lon)
+                if elev is not None:
+                    elevations[r * cols + c] = float(elev)
+                    filled += 1
+
+        response.success = filled > 0
+        response.rows = rows
+        response.cols = cols
+        response.elevations = elevations.tolist()
+
+        self.get_logger().info(
+            f'Grid check: {rows}x{cols} cells, {filled} filled'
+            f' ({request.min_latitude:.5f},{request.min_longitude:.5f})'
+            f' to ({request.max_latitude:.5f},{request.max_longitude:.5f})'
+        )
         return response
 
     # ---------------------------------------------------------------- timer
