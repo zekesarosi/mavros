@@ -77,6 +77,7 @@ set(msg_files
   msg/NavControllerOutput.msg
   msg/ObstacleDistance3D.msg
   msg/OnboardComputerStatus.msg
+  msg/OpenDroneIDArmStatus.msg
   msg/OpenDroneIDBasicID.msg
   msg/OpenDroneIDOperatorID.msg
   msg/OpenDroneIDSelfID.msg

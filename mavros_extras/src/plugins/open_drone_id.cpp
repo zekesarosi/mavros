@@ -9,6 +9,7 @@
  * @brief Open Drone ID plugin to satisfy remote ID requirements
  * @file open_drone_id.cpp
  * @author Gus Meyer <gus@robotics88.com>
+ * @author Zeke Sarosi <zeke.sarosi@gmail.com>
  *
  * @addtogroup plugin
  * @{
@@ -20,6 +21,7 @@
 #include "mavros/plugin.hpp"
 #include "mavros/plugin_filter.hpp"
 
+#include "mavros_msgs/msg/open_drone_id_arm_status.hpp"
 #include "mavros_msgs/msg/open_drone_id_basic_id.hpp"
 #include "mavros_msgs/msg/open_drone_id_operator_id.hpp"
 #include "mavros_msgs/msg/open_drone_id_self_id.hpp"
@@ -44,6 +46,9 @@ public:
   explicit OpenDroneIDPlugin(plugin::UASPtr uas_)
   : Plugin(uas_, "open_drone_id")
   {
+    arm_status_pub = node->create_publisher<mavros_msgs::msg::OpenDroneIDArmStatus>(
+      "~/arm_status", 10);
+
     basic_id_sub = node->create_subscription<mavros_msgs::msg::OpenDroneIDBasicID>(
       "~/basic_id", 1, std::bind(
         &OpenDroneIDPlugin::basic_id_cb, this,
@@ -70,18 +75,32 @@ public:
         _1));
   }
 
-  Subscriptions get_subscriptions()
+  Subscriptions get_subscriptions() override
   {
-    return {};
+    return {
+      make_handler(&OpenDroneIDPlugin::handle_arm_status),
+    };
   }
 
 private:
+  rclcpp::Publisher<mavros_msgs::msg::OpenDroneIDArmStatus>::SharedPtr arm_status_pub;
   rclcpp::Subscription<mavros_msgs::msg::OpenDroneIDBasicID>::SharedPtr basic_id_sub;
   rclcpp::Subscription<mavros_msgs::msg::OpenDroneIDOperatorID>::SharedPtr operator_id_sub;
   rclcpp::Subscription<mavros_msgs::msg::OpenDroneIDSelfID>::SharedPtr self_id_sub;
   rclcpp::Subscription<mavros_msgs::msg::OpenDroneIDSystem>::SharedPtr system_sub;
   rclcpp::Subscription<mavros_msgs::msg::OpenDroneIDSystemUpdate>::SharedPtr system_update_sub;
 
+  void handle_arm_status(
+    const mavlink::mavlink_message_t * msg [[maybe_unused]],
+    mavlink::common::msg::OPEN_DRONE_ID_ARM_STATUS & arm_status,
+    plugin::filter::SystemAndOk filter [[maybe_unused]])
+  {
+    auto rmsg = mavros_msgs::msg::OpenDroneIDArmStatus();
+    rmsg.header.stamp = node->now();
+    rmsg.status = arm_status.status;
+    rmsg.error = mavlink::to_string(arm_status.error);
+    arm_status_pub->publish(rmsg);
+  }
 
   void basic_id_cb(const mavros_msgs::msg::OpenDroneIDBasicID::SharedPtr msg)
   {
