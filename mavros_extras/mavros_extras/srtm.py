@@ -19,6 +19,7 @@ import os
 from pathlib import Path
 import struct
 import threading
+import time
 import urllib.error
 import urllib.request
 import zipfile
@@ -30,6 +31,8 @@ SRTM3_SIDE = 1201
 SRTM_VOID = -32768
 
 RADIUS_OF_EARTH = 6378100.0
+
+DOWNLOAD_RETRY_INTERVAL_SEC = 60.0
 
 # MAVLink TERRAIN_REQUEST grid layout (common.xml §TERRAIN_REQUEST):
 #   The terrain around a position is divided into a GRID_ROWS × GRID_COLS
@@ -85,7 +88,7 @@ class SrtmManager:
 
         self._cache: OrderedDict[int, SrtmTile | None] = OrderedDict()
         self._file_index: dict[str, Path] = {}
-        self._download_failed: set[int] = set()
+        self._download_failed: dict[int, float] = {}
         self._lock = threading.Lock()
 
         if not self._terrain_data_path and self._auto_download:
@@ -244,11 +247,14 @@ class SrtmManager:
         tile = self._load_tile(lat, lon)
 
         if tile is None and self._auto_download:
-            if key not in self._download_failed:
+            now = time.monotonic()
+            last_failure = self._download_failed.get(key)
+            if last_failure is None or (now - last_failure) >= DOWNLOAD_RETRY_INTERVAL_SEC:
                 if self._download_tile(lat, lon):
                     tile = self._load_tile(lat, lon)
+                    self._download_failed.pop(key, None)
                 else:
-                    self._download_failed.add(key)
+                    self._download_failed[key] = now
 
         with self._lock:
             if key in self._cache:
