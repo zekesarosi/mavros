@@ -41,6 +41,7 @@ set(msg_files
   msg/CommandCode.msg
   msg/CompanionProcessStatus.msg
   msg/DebugValue.msg
+  msg/EKFStatusReport.msg
   msg/ESCInfo.msg
   msg/ESCInfoItem.msg
   msg/ESCStatus.msg
@@ -114,7 +115,7 @@ set(msg_files
   msg/WaypointList.msg
   msg/WaypointReached.msg
   msg/WheelOdomStamped.msg
-  # [[[end]]] (sum: WNC7AFvjZ5)
+  # [[[end]]]
 )
 
 set(srv_files

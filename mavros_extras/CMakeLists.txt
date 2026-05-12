@@ -110,6 +110,7 @@ add_library(mavros_extras_plugins SHARED
   src/plugins/companion_process_status.cpp
   src/plugins/debug_value.cpp
   src/plugins/distance_sensor.cpp
+  src/plugins/ekf_status.cpp
   src/plugins/esc_status.cpp
   src/plugins/esc_telemetry.cpp
   src/plugins/fake_gps.cpp
@@ -142,7 +143,7 @@ add_library(mavros_extras_plugins SHARED
   src/plugins/vision_pose_estimate.cpp
   src/plugins/vision_speed_estimate.cpp
   src/plugins/wheel_odometry.cpp
-  # [[[end]]] (sum: WzAyzLqsp3)
+  # [[[end]]]
 )
 target_link_libraries(mavros_extras_plugins PUBLIC
   ${geographic_msgs_TARGETS}

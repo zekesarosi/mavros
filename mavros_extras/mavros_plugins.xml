@@ -51,6 +51,13 @@ Publishes the status of components running on the companion computer
 This plugin allows publishing distance sensor data, which is connected to
 an offboard/companion computer through USB/Serial, to the FCU or vice-versa.</description>
   </class>
+  <class name="ekf_status" type="mavros::plugin::PluginFactoryTemplate&lt;mavros::extra_plugins::EKFStatusPlugin&gt;" base_class_type="mavros::plugin::PluginFactory">
+    <description>@brief EKF status report plugin
+@plugin ekf_status
+
+APM specific plugin. Publishes EKF_STATUS_REPORT (id 193) flags and
+variances from the ArduPilot EKF to ROS.</description>
+  </class>
   <class name="esc_status" type="mavros::plugin::PluginFactoryTemplate&lt;mavros::extra_plugins::ESCStatusPlugin&gt;" base_class_type="mavros::plugin::PluginFactory">
     <description>@brief ESC status plugin
 @plugin esc_status</description>
@@ -279,4 +286,4 @@ This plugin allows computing and publishing wheel odometry coming from FCU wheel
 Can use either wheel's RPM or WHEEL_DISTANCE messages (the latter gives better accuracy).</description>
   </class>
 </library>
-<!-- [[[end]]] (sum: DX8/hQxBgA) -->
+<!-- [[[end]]] -->
