@@ -12,9 +12,11 @@ from __future__ import annotations
 from collections import deque
 import math
 import threading
+import time
 
 import numpy as np
 
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from mavros_extras.srtm import (
     compute_terrain_data_block,
     GRID_COLS,
@@ -69,6 +71,10 @@ class TerrainServerNode(Node):
         if rate_hz <= 0.0:
             rate_hz = 5.0
 
+        self._auto_download = bool(auto_download)
+        self._download_host = str(download_host)
+        self._srtm_source = str(srtm_source)
+
         self._mgr = SrtmManager(
             terrain_data_path=terrain_data_path,
             auto_download=auto_download,
@@ -82,6 +88,12 @@ class TerrainServerNode(Node):
 
         self._blocks_served = 0
         self._requests_received = 0
+        self._completed_requests = 0
+        self._last_request_monotonic = 0.0
+        self._last_grid_check_rows = 0
+        self._last_grid_check_cols = 0
+        self._last_grid_check_filled = 0
+        self._last_grid_check_monotonic = 0.0
 
         self._data_pub = self.create_publisher(
             TerrainData,
@@ -111,6 +123,14 @@ class TerrainServerNode(Node):
         period = 1.0 / rate_hz
         self._timer = self.create_timer(period, self._on_send_tick)
 
+        self._diagnostics_pub = self.create_publisher(
+            DiagnosticArray,
+            '/diagnostics',
+            QoSProfile(depth=10),
+        )
+        self._diagnostics_timer = self.create_timer(1.0, self._publish_diagnostics)
+        self._summary_log_timer = self.create_timer(10.0, self._log_summary)
+
         self.get_logger().info(
             f'Terrain server ready  path={terrain_data_path or "(none)"}'
             f'  auto_download={auto_download}  rate={rate_hz:.1f} Hz'
@@ -139,9 +159,10 @@ class TerrainServerNode(Node):
 
             self._pending.append(_PendingRequest(msg.lat, msg.lon, msg.grid_spacing, msg.mask))
             self._requests_received += 1
+            self._last_request_monotonic = time.monotonic()
             count = self._requests_received
 
-        self.get_logger().info(
+        self.get_logger().debug(
             f'TERRAIN_REQUEST #{count} lat={lat_deg:.7f} lon={lon_deg:.7f}'
             f' spacing={msg.grid_spacing} mask=0x{msg.mask:016x}'
         )
@@ -200,7 +221,13 @@ class TerrainServerNode(Node):
         response.cols = cols
         response.elevations = elevations.tolist()
 
-        self.get_logger().info(
+        with self._lock:
+            self._last_grid_check_rows = rows
+            self._last_grid_check_cols = cols
+            self._last_grid_check_filled = filled
+            self._last_grid_check_monotonic = time.monotonic()
+
+        self.get_logger().debug(
             f'Grid check: {rows}x{cols} cells, {filled} filled'
             f' ({request.min_latitude:.5f},{request.min_longitude:.5f})'
             f' to ({request.max_latitude:.5f},{request.max_longitude:.5f})'
@@ -245,13 +272,107 @@ class TerrainServerNode(Node):
                 req.sent_mask |= 1 << bit
                 self._blocks_served += 1
                 if req.remaining == 0:
-                    self.get_logger().info(
+                    self._completed_requests += 1
+                    self.get_logger().debug(
                         f'Completed terrain request lat={req.lat / 1e7:.7f}'
                         f' lon={req.lon / 1e7:.7f}'
                         f' ({self._blocks_served} blocks served total)'
                     )
 
             return
+
+    # ----------------------------------------------------------- diagnostics
+
+    def _snapshot_state(self):
+        with self._lock:
+            tiles_indexed = len(self._mgr._file_index)
+            tiles_in_memory = len(self._mgr._cache)
+            requests = self._requests_received
+            blocks = self._blocks_served
+            pending = len(self._pending)
+            completed = self._completed_requests
+            last_req_mono = self._last_request_monotonic
+            gc_rows = self._last_grid_check_rows
+            gc_cols = self._last_grid_check_cols
+            gc_filled = self._last_grid_check_filled
+            gc_mono = self._last_grid_check_monotonic
+        return (
+            tiles_indexed, tiles_in_memory, requests, blocks, pending,
+            completed, last_req_mono, gc_rows, gc_cols, gc_filled, gc_mono,
+        )
+
+    def _publish_diagnostics(self) -> None:
+        (tiles_indexed, tiles_in_memory, requests, blocks, pending,
+         completed, last_req_mono,
+         gc_rows, gc_cols, gc_filled, _gc_mono) = self._snapshot_state()
+
+        now_mono = time.monotonic()
+        last_request_age = -1.0
+        if last_req_mono > 0.0:
+            last_request_age = now_mono - last_req_mono
+
+        status = DiagnosticStatus()
+        status.name = 'terrain_server_node: SRTM'
+        status.hardware_id = 'terrain_server_node'
+
+        def kv(k: str, v: str) -> KeyValue:
+            keyvalue = KeyValue()
+            keyvalue.key = k
+            keyvalue.value = v
+            return keyvalue
+
+        status.values = [
+            kv('tiles_indexed', str(tiles_indexed)),
+            kv('tiles_in_memory', str(tiles_in_memory)),
+            kv('auto_download', 'true' if self._auto_download else 'false'),
+            kv('download_host', self._download_host),
+            kv('srtm_source', self._srtm_source),
+            kv('requests_received', str(requests)),
+            kv('completed_requests', str(completed)),
+            kv('blocks_served', str(blocks)),
+            kv('pending_requests', str(pending)),
+            kv('last_grid_check_rows', str(gc_rows)),
+            kv('last_grid_check_cols', str(gc_cols)),
+            kv('last_grid_check_filled', str(gc_filled)),
+            kv('last_request_age_s', f'{last_request_age:.1f}'),
+        ]
+
+        if not self._auto_download and tiles_indexed == 0:
+            status.level = DiagnosticStatus.WARN
+            status.message = 'No SRTM tiles indexed and auto_download disabled'
+        elif tiles_indexed == 0 and tiles_in_memory == 0 and blocks == 0:
+            status.level = DiagnosticStatus.WARN
+            status.message = 'No SRTM data loaded yet'
+        elif last_request_age > 60.0:
+            status.level = DiagnosticStatus.STALE
+            status.message = (
+                f'No FCU terrain requests received in the last {last_request_age:.0f}s'
+            )
+        else:
+            status.level = DiagnosticStatus.OK
+            status.message = (
+                f'{tiles_indexed} tiles indexed; {blocks} blocks served '
+                f'({pending} pending)'
+            )
+
+        arr = DiagnosticArray()
+        arr.header.stamp = self.get_clock().now().to_msg()
+        arr.status.append(status)
+        self._diagnostics_pub.publish(arr)
+
+    def _log_summary(self) -> None:
+        (tiles_indexed, tiles_in_memory, requests, blocks, pending,
+         completed, _last_req_mono,
+         gc_rows, gc_cols, gc_filled, _gc_mono) = self._snapshot_state()
+
+        if requests == 0 and gc_filled == 0:
+            return
+
+        self.get_logger().info(
+            f'FCU terrain: tiles={tiles_indexed} (mem={tiles_in_memory}) '
+            f'requests={requests} completed={completed} pending={pending} '
+            f'blocks_served={blocks} last_grid={gc_rows}x{gc_cols}/{gc_filled}'
+        )
 
 
 def main(args=None) -> None:
