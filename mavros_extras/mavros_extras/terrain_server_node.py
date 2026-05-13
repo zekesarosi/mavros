@@ -129,7 +129,7 @@ class TerrainServerNode(Node):
             QoSProfile(depth=10),
         )
         self._diagnostics_timer = self.create_timer(1.0, self._publish_diagnostics)
-        self._summary_log_timer = self.create_timer(10.0, self._log_summary)
+        self._summary_log_timer = self.create_timer(60.0, self._log_summary)
 
         self.get_logger().info(
             f'Terrain server ready  path={terrain_data_path or "(none)"}'
