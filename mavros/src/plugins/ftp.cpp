@@ -109,7 +109,8 @@ public:
     kErrEOF,                    ///< Offset past end of file for List and Read commands
     kErrUnknownCommand,         ///< Unknown command opcode
     kErrFailFileExists,         ///< File exists already
-    kErrFailFileProtected       ///< File is write protected
+    kErrFailFileProtected,      ///< File is write protected
+    kErrFileNotFound            ///< File not found (ArduPilot extension, code 10)
   };
 
   static const char DIRENT_FILE = 'F';
@@ -382,16 +383,25 @@ private:
   uint32_t write_offset;
   V_FileData write_buffer;
   V_FileData::iterator write_it;
+  // Size of the most recent chunk handed to send_write_command(). Used to
+  // recover bytes_written when the FCU replies with an empty ACK payload
+  // (ArduPilot behavior; PX4 echoes the count in 4 bytes).
+  size_t last_write_chunk_size{0};
 
   // FTP:CalcCRC32
   uint32_t checksum_crc32;
 
-  // Timeouts,
-  // computed as x4 time that needed for transmission of
-  // one message at 57600 baud rate
+  // Timeouts. The original values (OPEN/CHUNK=200ms) were derived from
+  // 4x transmission time at 57600 baud and assumed a near-instant PX4 ack.
+  // ArduPilot FCUs (and PX4 under load) can easily take >200ms to service a
+  // single FTP request, which manifests as ETIMEDOUT (110) on the very first
+  // OPEN or WRITE chunk and leaves the session in a half-open state. QGC uses
+  // 1000ms with up to 6 retries; since we don't retry, give the FCU a full
+  // second per round-trip. WRITE budgets per chunk, so multi-chunk transfers
+  // scale linearly with file size.
   static constexpr int LIST_TIMEOUT_MS = 5000;
-  static constexpr int OPEN_TIMEOUT_MS = 200;
-  static constexpr int CHUNK_TIMEOUT_MS = 200;
+  static constexpr int OPEN_TIMEOUT_MS = 1000;
+  static constexpr int CHUNK_TIMEOUT_MS = 1000;
 
   //! Maximum difference between allocated space and used
   static constexpr size_t MAX_RESERVE_DIFF = 0x10000;
@@ -407,6 +417,22 @@ private:
     const mavlink::mavlink_message_t * msg [[maybe_unused]],
     FTPRequest & req,
     plugin::filter::SystemAndOk filter [[maybe_unused]])
+  {
+    try {
+      dispatch_file_transfer_protocol(req);
+    } catch (const std::exception & ex) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "FTP: dropped malformed packet (uncaught %s: %s); state=%u resetting",
+        typeid(ex).name(), ex.what(), enum_value(op_state));
+      go_idle(true, EBADMSG);
+    } catch (...) {
+      RCLCPP_ERROR(get_logger(), "FTP: dropped malformed packet (unknown exception); resetting");
+      go_idle(true, EBADMSG);
+    }
+  }
+
+  void dispatch_file_transfer_protocol(FTPRequest & req)
   {
     if (!req.decode_valid(uas)) {
       // RCLCPP_DEBUG(get_logger(), "FTP: Wrong System Id, MY %u, TGT %u",
@@ -456,12 +482,35 @@ private:
   void handle_req_nack(const FTPRequest & req)
   {
     auto hdr = req.header();
-    auto error_code = static_cast<FTPRequest::ErrorCode>(req.data()[0]);
     auto prev_op = op_state;
 
-    rcpputils::require_true(
+    // FCU may send a malformed NAK with the wrong payload size (observed in
+    // the field with ArduPilot @SYS/threads.txt: NAK size=0 instead of 1/2).
+    // The original code asserted via rcpputils::require_true which throws
+    // std::invalid_argument and aborts mavros_node. Treat it as a soft fault
+    // instead: log, NAK the in-flight request with EBADMSG, return to idle.
+    if (hdr->size == 0) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "FTP: NAK with empty payload (size=0, opcode=%u, state=%u); resetting",
+        hdr->req_opcode, enum_value(prev_op));
+      go_idle(true, EBADMSG);
+      return;
+    }
+
+    auto error_code = static_cast<FTPRequest::ErrorCode>(req.data()[0]);
+
+    const bool size_ok =
       hdr->size == 1 ||
-      (error_code == FTPRequest::kErrFailErrno && hdr->size == 2));
+      (error_code == FTPRequest::kErrFailErrno && hdr->size == 2);
+    if (!size_ok) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "FTP: NAK with invalid payload size (size=%u, err=%u, opcode=%u, state=%u); resetting",
+        hdr->size, error_code, hdr->req_opcode, enum_value(prev_op));
+      go_idle(true, EBADMSG);
+      return;
+    }
 
     op_state = OP::IDLE;
     if (error_code == FTPRequest::kErrFailErrno) {
@@ -478,6 +527,16 @@ private:
       r_errno = EMFILE;
     } else if (error_code == FTPRequest::kErrUnknownCommand) {
       r_errno = ENOSYS;
+    } else if (error_code == FTPRequest::kErrFailFileExists) {
+      r_errno = EEXIST;
+    } else if (error_code == FTPRequest::kErrFailFileProtected) {
+      r_errno = EACCES;
+    } else if (error_code == FTPRequest::kErrFileNotFound) {
+      r_errno = ENOENT;
+    } else {
+      // Unknown NAK code. Set a sentinel so r_errno doesn't carry stale state
+      // from a previous op (go_idle(true) with r_errno_=0 leaves it untouched).
+      r_errno = EIO;
     }
 
     if (prev_op == OP::LIST && error_code == FTPRequest::kErrEOF) {
@@ -486,6 +545,35 @@ private:
       return;
     } else if (prev_op == OP::READ && error_code == FTPRequest::kErrEOF) {
       /* read done */
+      read_file_end();
+      return;
+    }
+
+    // ArduPilot signals "no more directory entries from this offset" with
+    // various NAKs depending on firmware version and filesystem backend:
+    //   - kErrFileNotFound (code 10, AP extension) — newer ChibiOS builds
+    //   - kErrFailErrno + ERANGE — older AP, offset past last entry
+    //   - kErrFailErrno + ENOENT — directory genuinely missing
+    //   - kErrFailErrno + 0  — some builds set errno=0 for "nothing here"
+    // None of these distinguish "empty dir" from "missing dir", so we treat
+    // all of them as graceful end-of-listing: empty dir returns success+empty
+    // list, partial walks return whatever has accumulated so far.
+    const bool list_eof_ardupilot =
+      (error_code == FTPRequest::kErrFileNotFound) ||
+      (error_code == FTPRequest::kErrFailErrno &&
+      (r_errno == ERANGE || r_errno == ENOENT || r_errno == 0));
+    if (prev_op == OP::LIST && list_eof_ardupilot) {
+      RCLCPP_DEBUG(
+        get_logger(),
+        "FTP:List: FCU end-of-dir (code=%u r_errno=%d) at offset %u (%zu entries collected)",
+        error_code, r_errno, list_offset, list_entries.size());
+      list_directory_end();
+      return;
+    }
+
+    // ArduPilot returns kErrFileNotFound for READ past end-of-file too;
+    // mirror the kErrEOF path so reads complete with whatever bytes landed.
+    if (prev_op == OP::READ && error_code == FTPRequest::kErrFileNotFound) {
       read_file_end();
       return;
     }
@@ -517,16 +605,30 @@ private:
       const size_t bytes_left = hdr->size - off;
 
       size_t slen = strnlen(ptr, bytes_left);
+
+      // Missing NUL terminator: we can't trust anything past here. End the
+      // current chunk cleanly using whatever we already parsed instead of
+      // aborting the whole listing.
+      if (slen == bytes_left) {
+        RCLCPP_WARN(
+          get_logger(),
+          "FTP:List: missing NUL termination at offset %u of %u; truncating chunk",
+          off, hdr->size);
+        break;
+      }
+
+      // Malformed entry shape (SKIP that isn't "S\\0", or non-SKIP shorter than
+      // type+nul). Observed in the wild with ArduPilot. Skip just this entry
+      // and keep parsing the rest of the packet.
       if ((ptr[0] == FTPRequest::DIRENT_SKIP && slen > 1) ||
         (ptr[0] != FTPRequest::DIRENT_SKIP && slen < 2))
       {
-        RCLCPP_ERROR(get_logger(), "FTP: Incorrect list entry: %s", ptr);
-        go_idle(true, ERANGE);
-        return;
-      } else if (slen == bytes_left) {
-        RCLCPP_ERROR(get_logger(), "FTP: Missing NULL termination in list entry");
-        go_idle(true, EOVERFLOW);
-        return;
+        RCLCPP_WARN(
+          get_logger(),
+          "FTP:List: skipping malformed entry at offset %u (type='%c' slen=%zu)",
+          off, ptr[0] ? ptr[0] : '?', slen);
+        off += (slen > 0) ? slen + 1 : 1;
+        continue;
       }
 
       if (ptr[0] == FTPRequest::DIRENT_FILE ||
@@ -546,8 +648,16 @@ private:
     if (hdr->size == 0) {
       // dir empty, we are done
       list_directory_end();
+    } else if (n_list_entries == 0) {
+      // FCU returned a non-empty payload but every entry was a SKIP or
+      // otherwise unparsed; treat the listing as complete instead of
+      // aborting (assert_true used to throw and kill mavros_node).
+      RCLCPP_WARN(
+        get_logger(),
+        "FTP:List: %u bytes with 0 parseable entries at offset %u; ending walk",
+        hdr->size, list_offset);
+      list_directory_end();
     } else {
-      rcpputils::assert_true(n_list_entries > 0, "FTP:List don't parse entries");
       // Possibly more to come, try get more
       list_offset += n_list_entries;
       send_list_command();
@@ -559,8 +669,22 @@ private:
     auto hdr = req.header();
 
     RCLCPP_DEBUG(get_logger(), "FTP:m: ACK Open OPCODE(%u)", hdr->req_opcode);
-    rcpputils::require_true(hdr->size == sizeof(uint32_t));
-    open_size = *req.data_u32();
+    // PX4 always returns the file size as a 4-byte payload. ArduPilot returns
+    // the file size for OpenFileRO, but returns an empty payload for
+    // CreateFile (and sometimes OpenFileWO) - the new file's session_id is
+    // carried in the header. Accept both shapes so we work with both stacks.
+    if (hdr->size == 0) {
+      open_size = 0;
+    } else if (hdr->size == sizeof(uint32_t)) {
+      open_size = *req.data_u32();
+    } else {
+      RCLCPP_ERROR(
+        get_logger(),
+        "FTP:Open %s: malformed ACK payload size %u (expected 0 or %zu); aborting",
+        open_path.c_str(), hdr->size, sizeof(uint32_t));
+      go_idle(true, EBADMSG);
+      return;
+    }
 
     RCLCPP_INFO(
       get_logger(), "FTP:Open %s: success, session %u, size %zu",
@@ -622,13 +746,32 @@ private:
       return;
     }
 
-    rcpputils::require_true(hdr->size == sizeof(uint32_t));
-    const size_t bytes_written = *req.data_u32();
-
-    // check that reported size not out of range
+    // PX4 echoes bytes_written as a 4-byte payload. ArduPilot returns an
+    // empty payload on a successful write and expects the client to assume
+    // the full chunk landed. Accept both, falling back to the chunk size
+    // we just sent when no count is provided.
     const size_t bytes_left_before_advance = std::distance(write_it, write_buffer.end());
-    rcpputils::assert_true(bytes_written <= bytes_left_before_advance, "Bad write size");
-    rcpputils::assert_true(bytes_written != 0);
+    size_t bytes_written = 0;
+    if (hdr->size == 0) {
+      bytes_written = std::min<size_t>(last_write_chunk_size, bytes_left_before_advance);
+    } else if (hdr->size == sizeof(uint32_t)) {
+      bytes_written = *req.data_u32();
+    } else {
+      RCLCPP_ERROR(
+        lg, "FTP:Write: malformed ACK payload size %u (expected 0 or %zu); aborting",
+        hdr->size, sizeof(uint32_t));
+      go_idle(true, EBADMSG);
+      return;
+    }
+
+    if (bytes_written == 0 || bytes_written > bytes_left_before_advance) {
+      RCLCPP_ERROR(
+        lg,
+        "FTP:Write: bad bytes_written=%zu (left=%zu); aborting",
+        bytes_written, bytes_left_before_advance);
+      go_idle(true, EBADMSG);
+      return;
+    }
 
     // move iterator to written size
     std::advance(write_it, bytes_written);
@@ -649,7 +792,13 @@ private:
     auto lg = get_logger();
 
     RCLCPP_DEBUG(lg, "FTP:m: ACK CalcFileCRC32 OPCODE(%u)", hdr->req_opcode);
-    rcpputils::assert_true(hdr->size == sizeof(uint32_t));
+    if (hdr->size != sizeof(uint32_t)) {
+      RCLCPP_ERROR(
+        lg, "FTP:Checksum: malformed ACK payload size %u (expected %zu); aborting",
+        hdr->size, sizeof(uint32_t));
+      go_idle(true, EBADMSG);
+      return;
+    }
     checksum_crc32 = *req.data_u32();
 
     RCLCPP_DEBUG(lg, "FTP:Checksum: success, crc32: 0x%08x", checksum_crc32);
@@ -736,12 +885,24 @@ private:
 
   void send_read_command()
   {
-    // read operation always try read DATA_MAXSZ block (hdr->size ignored)
+    // PX4 ignores the requested size and always returns up to DATA_MAXSZ.
+    // ArduPilot honors it: size=0 is treated as "read 0 bytes" and the FCU
+    // immediately responds NAK kErrEOF, so a 0-length read short-circuits
+    // every read before any data is returned. Ask for the maximum chunk
+    // (clipped to how much we still need); both stacks then return up to
+    // DATA_MAXSZ, with the last chunk being smaller when we hit EOF.
+    const size_t bytes_left = (read_size > read_buffer.size())
+      ? (read_size - read_buffer.size())
+      : 0;
+    const size_t requested =
+      std::min<size_t>(FTPRequest::DATA_MAXSZ, std::max<size_t>(bytes_left, 1));
     RCLCPP_DEBUG_STREAM(
-      get_logger(), "FTP:m: kCmdReadFile: " << active_session << " off: " << read_offset);
+      get_logger(),
+      "FTP:m: kCmdReadFile: " << active_session << " off: " << read_offset <<
+        " req: " << requested);
     FTPRequest req(FTPRequest::kCmdReadFile, active_session);
     req.header()->offset = read_offset;
-    req.header()->size = 0 /* FTPRequest::DATA_MAXSZ */;
+    req.header()->size = requested;
     req.send(uas, last_send_seqnr);
   }
 
@@ -755,6 +916,7 @@ private:
     req.header()->offset = write_offset;
     req.header()->size = bytes_to_copy;
     std::copy(write_it, write_it + bytes_to_copy, req.data());
+    last_write_chunk_size = bytes_to_copy;
     req.send(uas, last_send_seqnr);
   }
 
@@ -824,7 +986,19 @@ private:
       if (sep_it != name_size.end()) {
         name_size.erase(name_size.begin(), sep_it + 1);
         if (name_size.size() != 0) {
-          ent.size = std::stoi(name_size);
+          // std::stoi throws std::invalid_argument on non-numeric input and
+          // std::out_of_range on overflow. Both have been observed against
+          // ArduPilot's @SYS virtual files. Treat as "size unknown" rather
+          // than letting the exception escape and kill mavros_node.
+          try {
+            ent.size = std::stoi(name_size);
+          } catch (const std::exception & ex) {
+            RCLCPP_WARN(
+              get_logger(),
+              "FTP:List File: %s has unparseable size %s (%s); reporting 0",
+              ent.name.c_str(), name_size.c_str(), ex.what());
+            ent.size = 0;
+          }
         }
       }
 
@@ -1014,18 +1188,29 @@ private:
 
   /**
    * Service handler common header code.
+   *
+   * An uncaught exception in a rclcpp service callback unwinds into the
+   * executor and aborts mavros_node, so previously throwing here turned a
+   * concurrent /mavros/ftp/* call into a full node crash plus a cascade
+   * reap of every dependent group. NAK the request cleanly instead.
    */
-#define SERVICE_IDLE_CHECK() \
-  if (op_state != OP::IDLE) { \
-    RCLCPP_ERROR(get_logger(), "FTP: Busy"); \
-    throw std::runtime_error("ftp busy"); \
-  }
+#define SERVICE_IDLE_CHECK_OR_BUSY(res) \
+  do { \
+    if (op_state != OP::IDLE) { \
+      RCLCPP_WARN( \
+        get_logger(), "FTP: Busy (state=%u); rejecting call", \
+        enum_value(op_state)); \
+      (res)->success = false; \
+      (res)->r_errno = EBUSY; \
+      return; \
+    } \
+  } while (0)
 
   void list_cb(
     const mavros_msgs::srv::FileList::Request::SharedPtr req,
     mavros_msgs::srv::FileList::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     list_directory(req->dir_path);
     res->success = wait_completion(LIST_TIMEOUT_MS);
@@ -1040,15 +1225,17 @@ private:
     const mavros_msgs::srv::FileOpen::Request::SharedPtr req,
     mavros_msgs::srv::FileOpen::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     // only one session per file
     auto it = session_file_map.find(req->file_path);
     if (it != session_file_map.end()) {
-      RCLCPP_ERROR(
-        get_logger(), "FTP: File %s: already opened",
+      RCLCPP_WARN(
+        get_logger(), "FTP: File %s: already opened; rejecting call",
         req->file_path.c_str());
-      throw std::runtime_error("file already opened");
+      res->success = false;
+      res->r_errno = EALREADY;
+      return;
     }
 
     res->success = open_file(req->file_path, req->mode);
@@ -1063,7 +1250,7 @@ private:
     const mavros_msgs::srv::FileClose::Request::SharedPtr req,
     mavros_msgs::srv::FileClose::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     res->success = close_file(req->file_path);
     if (res->success) {
@@ -1076,7 +1263,7 @@ private:
     const mavros_msgs::srv::FileRead::Request::SharedPtr req,
     mavros_msgs::srv::FileRead::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     res->success = read_file(req->file_path, req->offset, req->size);
     if (res->success) {
@@ -1093,7 +1280,7 @@ private:
     const mavros_msgs::srv::FileWrite::Request::SharedPtr req,
     mavros_msgs::srv::FileWrite::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     const size_t data_size = req->data.size();
     res->success = write_file(req->file_path, req->offset, req->data);
@@ -1108,7 +1295,7 @@ private:
     const mavros_msgs::srv::FileRemove::Request::SharedPtr req,
     mavros_msgs::srv::FileRemove::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     remove_file(req->file_path);
     res->success = wait_completion(OPEN_TIMEOUT_MS);
@@ -1119,7 +1306,7 @@ private:
     const mavros_msgs::srv::FileRename::Request::SharedPtr req,
     mavros_msgs::srv::FileRename::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     res->success = rename_(req->old_path, req->new_path);
     if (res->success) {
@@ -1132,7 +1319,7 @@ private:
     const mavros_msgs::srv::FileTruncate::Request::SharedPtr req,
     mavros_msgs::srv::FileTruncate::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     // Note: emulated truncate() can take a while
     truncate_file(req->file_path, req->length);
@@ -1144,7 +1331,7 @@ private:
     const mavros_msgs::srv::FileMakeDir::Request::SharedPtr req,
     mavros_msgs::srv::FileMakeDir::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     create_directory(req->dir_path);
     res->success = wait_completion(OPEN_TIMEOUT_MS);
@@ -1155,7 +1342,7 @@ private:
     const mavros_msgs::srv::FileRemoveDir::Request::SharedPtr req,
     mavros_msgs::srv::FileRemoveDir::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     remove_directory(req->dir_path);
     res->success = wait_completion(OPEN_TIMEOUT_MS);
@@ -1166,7 +1353,7 @@ private:
     const mavros_msgs::srv::FileChecksum::Request::SharedPtr req,
     mavros_msgs::srv::FileChecksum::Response::SharedPtr res)
   {
-    SERVICE_IDLE_CHECK();
+    SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     checksum_crc32_file(req->file_path);
     res->success = wait_completion(LIST_TIMEOUT_MS);
@@ -1174,7 +1361,7 @@ private:
     res->r_errno = r_errno;
   }
 
-#undef SERVICE_IDLE_CHECK
+#undef SERVICE_IDLE_CHECK_OR_BUSY
 
   /**
    * @brief Reset communication on both sides.
@@ -1184,8 +1371,15 @@ private:
     const std_srvs::srv::Empty::Request::SharedPtr req [[maybe_unused]],
     std_srvs::srv::Empty::Response::SharedPtr res [[maybe_unused]])
   {
+    // send_reset() flips op_state to OP::ACK and ships the request. The
+    // original code returned immediately after that, so the reset service
+    // call appeared to succeed while the plugin was still mid-handshake.
+    // Every following service call then took the IDLE-check fast path and
+    // bailed with EBUSY (16) until the FCU's ack happened to arrive between
+    // calls. Wait synchronously, matching every other service in this file.
     send_reset();
     session_file_map.clear();
+    wait_completion(OPEN_TIMEOUT_MS);
   }
 };
 
