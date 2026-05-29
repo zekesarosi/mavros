@@ -14,6 +14,7 @@
  * @{
  */
 
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <condition_variable>
@@ -363,6 +364,10 @@ private:
   std::condition_variable cond;         //!< wait condvar
   bool is_error;                        //!< error signaling flag (timeout/proto error)
   int r_errno;                          //!< store errno from server
+  //! Monotonic counter of accepted FCU replies. wait_completion() uses it as a
+  //! liveness signal so a multi-round-trip op (LIST/READ/WRITE) is bounded by
+  //! an inter-packet stall budget rather than a fixed total-time budget.
+  std::atomic<uint32_t> rx_progress{0};
 
   // FTP:List
   uint32_t list_offset;
@@ -378,6 +383,22 @@ private:
   size_t read_size;
   uint32_t read_offset;
   V_FileData read_buffer;
+  // FTP:Read uses kCmdBurstReadFile: the FCU streams many replies per request,
+  // so throughput is bounded by link bandwidth instead of per-chunk round-trip
+  // latency (a serial kCmdReadFile read tops out around ~15 KB/s). read_offset
+  // is the contiguous frontier (next byte we still need); ordering is validated
+  // by file offset rather than seqnr, since a burst breaks 1:1 request/response
+  // pairing.
+  bool burst_resync_pending{false};   //!< a gap-recovery re-request is in flight
+  uint32_t burst_resync_count{0};     //!< bounds re-requests on a lossy link
+  //! Set when we already have all requested bytes but the FCU is still mid-burst.
+  //! We stop requesting more and discard the tail until the burst completes, so
+  //! no stray streamed replies leak into the next operation's seqnr window.
+  bool burst_draining{false};
+  //! Per-message payload size we ask the FCU to stream (also the EOF sentinel:
+  //! a burst-complete chunk shorter than this marks end-of-file).
+  static constexpr uint8_t BURST_CHUNK = FTPRequest::DATA_MAXSZ;
+  static constexpr uint32_t MAX_BURST_RESYNCS = 4000;
 
   // FTP:Write
   uint32_t write_offset;
@@ -440,17 +461,49 @@ private:
       return;
     }
 
-    const uint16_t incoming_seqnr = req.header()->seqNumber;
-    const uint16_t expected_seqnr = last_send_seqnr + 1;
-    if (incoming_seqnr != expected_seqnr) {
-      RCLCPP_WARN(
-        get_logger(), "FTP: Lost sync! seqnr: %u != %u",
-        incoming_seqnr, expected_seqnr);
-      go_idle(true, EILSEQ);
+    // We only ever originate an FTP transaction from a service callback, which
+    // flips op_state away from IDLE before the first request leaves. So while
+    // we are IDLE every FILE_TRANSFER_PROTOCOL message on the link belongs to
+    // someone else (e.g. a GCS running its own MAVFTP session over a shared
+    // router) or is a late/duplicate reply to a transaction we already
+    // abandoned on timeout. Reacting is actively harmful: the foreign seqnr
+    // won't match ours, so we'd emit an endless "Lost sync" flood and could
+    // inject a spurious reset into the FCU, stomping the other client's
+    // in-flight session. Drop it silently.
+    if (op_state == OP::IDLE) {
       return;
     }
 
-    last_send_seqnr = incoming_seqnr;
+    const uint16_t incoming_seqnr = req.header()->seqNumber;
+    const uint16_t expected_seqnr = last_send_seqnr + 1;
+    if (incoming_seqnr != expected_seqnr) {
+      // A burst read intentionally breaks 1:1 request/response pairing: the FCU
+      // streams many replies (each advancing seqnr) for a single
+      // kCmdBurstReadFile, and a dropped datagram would otherwise abort the
+      // whole transfer here. While reading, accept and resync to the stream;
+      // handle_ack_read() validates ordering by file offset and recovers gaps.
+      // Outside a read, a seqnr mismatch is a real desync.
+      if (op_state != OP::READ) {
+        // Throttled: a single desync inside our own transaction is worth
+        // knowing about, but on a shared link foreign traffic can interleave
+        // with our reply, so cap the rate to keep logs readable.
+        RCLCPP_WARN_THROTTLE(
+          get_logger(), *get_clock(), 1000, "FTP: Lost sync! seqnr: %u != %u",
+          incoming_seqnr, expected_seqnr);
+        go_idle(true, EILSEQ);
+        return;
+      }
+    }
+
+    // NOTE: last_send_seqnr is a pure outgoing counter (bumped once per request
+    // in req.send below) and is deliberately NOT resynced to incoming_seqnr.
+    // A burst yields many replies for one request, so tracking the received
+    // seqnr would make the next request reuse a seqnr the FCU already consumed
+    // and the FCU would ignore it (the burst would stall after one window).
+    // The FCU always answers a request with request_seqnr+1, so an independent
+    // send counter stays in lockstep for serial ops and lets bursts continue
+    // correctly (this matches pymavlink's mavftp client).
+    rx_progress.fetch_add(1, std::memory_order_relaxed);
 
     // logic from QGCUASFileManager.cc
     if (req.header()->opcode == FTPRequest::kRspAck) {
@@ -465,8 +518,11 @@ private:
 
   void handle_req_ack(const FTPRequest & req)
   {
+    // OP::IDLE is unreachable here: dispatch_file_transfer_protocol() drops
+    // every reply that arrives while we are idle, so any ACK seen here belongs
+    // to an operation we actually started. An idle ACK therefore falls through
+    // to the default "wrong op_state" guard below.
     switch (op_state) {
-      case OP::IDLE:          send_reset();                   break;
       case OP::ACK:           go_idle(false);                 break;
       case OP::LIST:          handle_ack_list(req);           break;
       case OP::OPEN:          handle_ack_open(req);           break;
@@ -617,6 +673,20 @@ private:
         break;
       }
 
+      // Empty entry (a bare NUL). ArduPilot separates/pads directory entries
+      // with double-NULs, so a listing reads as "<entry>\0\0<entry>\0\0...".
+      // These empties carry no information and are not an error; skip the NUL
+      // quietly. Warning on them (as a malformed entry) floods the log and,
+      // for large directories like APM/LOGS (~200 logs over ~20 paginated
+      // round-trips), the synchronous logging overruns LIST_TIMEOUT_MS and the
+      // whole listing fails with ETIMEDOUT. They must not count toward
+      // n_list_entries either: the FCU's next offset only advances by the
+      // number of real entries it returned.
+      if (slen == 0) {
+        off += 1;
+        continue;
+      }
+
       // Malformed entry shape (SKIP that isn't "S\\0", or non-SKIP shorter than
       // type+nul). Observed in the wild with ArduPilot. Skip just this entry
       // and keep parsing the rest of the packet.
@@ -627,7 +697,7 @@ private:
           get_logger(),
           "FTP:List: skipping malformed entry at offset %u (type='%c' slen=%zu)",
           off, ptr[0] ? ptr[0] : '?', slen);
-        off += (slen > 0) ? slen + 1 : 1;
+        off += slen + 1;
         continue;
       }
 
@@ -693,6 +763,17 @@ private:
     go_idle(false);
   }
 
+  /**
+   * @brief Handle one streamed kCmdBurstReadFile reply.
+   *
+   * Reads use burst download exclusively: the FCU streams a sequence of ACKs
+   * for a single burst request, each carrying data at an increasing file offset
+   * and a burst_complete flag on the last message of the burst. We accept
+   * chunks at our contiguous frontier (read_offset), drop duplicates, and on a
+   * gap (lost datagram) re-request the burst from the frontier. When a burst
+   * completes with more file remaining we request the next burst; a short
+   * burst-complete chunk or a NAK(EOF) ends the transfer.
+   */
   void handle_ack_read(const FTPRequest & req)
   {
     auto hdr = req.header();
@@ -705,26 +786,66 @@ private:
       return;
     }
 
-    if (hdr->offset != read_offset) {
-      RCLCPP_ERROR(lg, "FTP:Read different offset");
-      go_idle(true, EBADE);
+    const uint32_t in_off = hdr->offset;
+    const uint8_t n = hdr->size;
+    // MAVLink FTP packs burst_complete at payload byte 6, which is padding[0]
+    // in our PayloadHeader (offset 7 is the real alignment pad).
+    const bool burst_complete = hdr->padding[0] != 0;
+
+    if (burst_draining) {
+      // We already have everything the caller asked for; just swallow the rest
+      // of the in-flight burst (the FCU streams autonomously until its burst
+      // boundary) and finish once it signals completion. NAK(EOF) is handled in
+      // handle_req_nack and also ends the read.
+      if (burst_complete) {
+        read_file_end();
+      }
       return;
     }
 
-    // kCmdReadFile return cunks of DATA_MAXSZ or smaller (last chunk)
-    // We requested specific amount of data, that can be smaller,
-    // but not larger.
+    if (in_off > read_offset) {
+      if (!burst_resync_pending) {
+        if (++burst_resync_count > MAX_BURST_RESYNCS) {
+          RCLCPP_ERROR(
+            lg, "FTP:BurstRead: too many resyncs (got %u, want %u); aborting",
+            in_off, read_offset);
+          go_idle(true, EIO);
+          return;
+        }
+        RCLCPP_DEBUG(lg, "FTP:BurstRead: gap (got %u, want %u); resyncing", in_off, read_offset);
+        send_burst_read_command();
+        burst_resync_pending = true;
+      }
+      return;
+    }
+
+    if (in_off < read_offset) {
+      return;
+    }
+
+    // In-order chunk at the frontier.
+    burst_resync_pending = false;
     const size_t bytes_left = read_size - read_buffer.size();
-    const size_t bytes_to_copy = std::min<size_t>(bytes_left, hdr->size);
-
+    const size_t bytes_to_copy = std::min<size_t>(bytes_left, n);
     read_buffer.insert(read_buffer.end(), req.data(), req.data() + bytes_to_copy);
+    read_offset += bytes_to_copy;
 
-    if (bytes_to_copy == FTPRequest::DATA_MAXSZ) {
-      // Possibly more data
-      read_offset += bytes_to_copy;
-      send_read_command();
-    } else {
-      read_file_end();
+    if (read_buffer.size() >= read_size) {
+      // Got everything the caller asked for.
+      if (burst_complete) {
+        read_file_end();
+      } else {
+        burst_draining = true;
+      }
+      return;
+    }
+
+    if (burst_complete) {
+      if (n < BURST_CHUNK) {
+        read_file_end();
+        return;
+      }
+      send_burst_read_command();
     }
   }
 
@@ -746,10 +867,6 @@ private:
       return;
     }
 
-    // PX4 echoes bytes_written as a 4-byte payload. ArduPilot returns an
-    // empty payload on a successful write and expects the client to assume
-    // the full chunk landed. Accept both, falling back to the chunk size
-    // we just sent when no count is provided.
     const size_t bytes_left_before_advance = std::distance(write_it, write_buffer.end());
     size_t bytes_written = 0;
     if (hdr->size == 0) {
@@ -816,6 +933,9 @@ private:
   void go_idle(bool is_error_, int r_errno_ = 0)
   {
     op_state = OP::IDLE;
+    // Clear burst bookkeeping between operations.
+    burst_resync_pending = false;
+    burst_draining = false;
     is_error = is_error_;
     if (is_error && r_errno_ != 0) {
       r_errno = r_errno_;
@@ -837,7 +957,7 @@ private:
 
     op_state = OP::ACK;
     FTPRequest req(FTPRequest::kCmdResetSessions);
-    req.send(uas, last_send_seqnr);
+    req.send(uas, ++last_send_seqnr);
   }
 
   /// Send any command with string payload (usually file/dir path)
@@ -849,7 +969,7 @@ private:
     FTPRequest req(op);
     req.header()->offset = offset;
     req.set_data_string(path);
-    req.send(uas, last_send_seqnr);
+    req.send(uas, ++last_send_seqnr);
   }
 
   void send_list_command()
@@ -880,30 +1000,22 @@ private:
     FTPRequest req(FTPRequest::kCmdTerminateSession, session);
     req.header()->offset = 0;
     req.header()->size = 0;
-    req.send(uas, last_send_seqnr);
+    req.send(uas, ++last_send_seqnr);
   }
 
-  void send_read_command()
+  void send_burst_read_command()
   {
-    // PX4 ignores the requested size and always returns up to DATA_MAXSZ.
-    // ArduPilot honors it: size=0 is treated as "read 0 bytes" and the FCU
-    // immediately responds NAK kErrEOF, so a 0-length read short-circuits
-    // every read before any data is returned. Ask for the maximum chunk
-    // (clipped to how much we still need); both stacks then return up to
-    // DATA_MAXSZ, with the last chunk being smaller when we hit EOF.
-    const size_t bytes_left = (read_size > read_buffer.size())
-      ? (read_size - read_buffer.size())
-      : 0;
-    const size_t requested =
-      std::min<size_t>(FTPRequest::DATA_MAXSZ, std::max<size_t>(bytes_left, 1));
+    // size is the per-message payload the FCU should stream (<= DATA_MAXSZ).
+    // The FCU then streams consecutive chunks from read_offset until a burst
+    // boundary (burst_complete) or EOF, without us asking for each one.
     RCLCPP_DEBUG_STREAM(
       get_logger(),
-      "FTP:m: kCmdReadFile: " << active_session << " off: " << read_offset <<
-        " req: " << requested);
-    FTPRequest req(FTPRequest::kCmdReadFile, active_session);
+      "FTP:m: kCmdBurstReadFile: " << active_session << " off: " << read_offset <<
+        " chunk: " << static_cast<unsigned>(BURST_CHUNK));
+    FTPRequest req(FTPRequest::kCmdBurstReadFile, active_session);
     req.header()->offset = read_offset;
-    req.header()->size = requested;
-    req.send(uas, last_send_seqnr);
+    req.header()->size = BURST_CHUNK;
+    req.send(uas, ++last_send_seqnr);
   }
 
   void send_write_command(const size_t bytes_to_copy)
@@ -917,7 +1029,7 @@ private:
     req.header()->size = bytes_to_copy;
     std::copy(write_it, write_it + bytes_to_copy, req.data());
     last_write_chunk_size = bytes_to_copy;
-    req.send(uas, last_send_seqnr);
+    req.send(uas, ++last_send_seqnr);
   }
 
   void send_remove_command(const std::string & path)
@@ -1088,7 +1200,11 @@ private:
       read_buffer.reserve(len);
     }
 
-    send_read_command();
+    // Burst download: one request, many streamed replies (see handle_ack_read).
+    burst_resync_pending = false;
+    burst_resync_count = 0;
+    burst_draining = false;
+    send_burst_read_command();
     return true;
   }
 
@@ -1154,11 +1270,6 @@ private:
     send_calc_file_crc32_command(path);
   }
 
-  static constexpr int compute_rw_timeout(size_t len)
-  {
-    return CHUNK_TIMEOUT_MS * (len / FTPRequest::DATA_MAXSZ + 1);
-  }
-
   size_t write_bytes_to_copy()
   {
     return std::min<size_t>(
@@ -1166,21 +1277,55 @@ private:
       FTPRequest::DATA_MAXSZ);
   }
 
+  /**
+   * @brief Wait for the in-flight operation to finish.
+   *
+   * @param msecs inter-packet stall budget (NOT total time). The op is allowed
+   *   to run arbitrarily long as long as the FCU keeps making forward progress;
+   *   we only fail if no reply is accepted for the whole budget. This is
+   *   required because some FCU operations are not O(1) per request: ArduPilot
+   *   serves ListDirectory(offset=N) in O(N), so enumerating a large directory
+   *   (e.g. APM/LOGS with hundreds of dataflash logs) is O(N^2) and easily
+   *   exceeds any sane fixed total budget, while each individual round-trip
+   *   still completes quickly. cond is signalled by go_idle() on completion;
+   *   rx_progress advances on every accepted reply in between.
+   */
   bool wait_completion(const int msecs)
   {
     std::unique_lock<std::mutex> lock(cond_mutex);
 
-    bool is_timedout = cond.wait_for(lock, std::chrono::milliseconds(msecs)) ==
-      std::cv_status::timeout;
+    uint32_t last_progress = rx_progress.load(std::memory_order_relaxed);
+    for (;;) {
+      // Completion (success or error) may have landed before we got here.
+      if (op_state == OP::IDLE) {
+        return !is_error;
+      }
 
-    if (is_timedout) {
-      // If timeout occurs don't forget to reset state
+      const bool timedout =
+        cond.wait_for(lock, std::chrono::milliseconds(msecs)) == std::cv_status::timeout;
+
+      if (op_state == OP::IDLE) {
+        // go_idle() ran -> operation finished (cond was notified).
+        return !is_error;
+      }
+
+      if (!timedout) {
+        // Spurious wakeup with the op still running; keep waiting.
+        continue;
+      }
+
+      const uint32_t now_progress = rx_progress.load(std::memory_order_relaxed);
+      if (now_progress != last_progress) {
+        // FCU answered (another page/chunk) within the window: still alive,
+        // reset the stall clock and keep going.
+        last_progress = now_progress;
+        continue;
+      }
+
+      // No progress for the whole budget and not idle -> genuine stall.
       op_state = OP::IDLE;
       r_errno = ETIMEDOUT;
       return false;
-    } else {
-      // if go_idle() occurs before timeout
-      return !is_error;
     }
   }
 
@@ -1267,7 +1412,9 @@ private:
 
     res->success = read_file(req->file_path, req->offset, req->size);
     if (res->success) {
-      res->success = wait_completion(compute_rw_timeout(req->size));
+      // Per-chunk stall budget: a multi-chunk read may run long in total, but
+      // each DATA_MAXSZ chunk must keep arriving.
+      res->success = wait_completion(CHUNK_TIMEOUT_MS);
     }
     if (res->success) {
       res->data = std::move(read_buffer);
@@ -1282,10 +1429,11 @@ private:
   {
     SERVICE_IDLE_CHECK_OR_BUSY(res);
 
-    const size_t data_size = req->data.size();
     res->success = write_file(req->file_path, req->offset, req->data);
     if (res->success) {
-      res->success = wait_completion(compute_rw_timeout(data_size));
+      // Per-chunk stall budget (see read_cb): the whole write may take a while
+      // for a large blob, but each chunk ACK must keep coming.
+      res->success = wait_completion(CHUNK_TIMEOUT_MS);
     }
     write_buffer.clear();
     res->r_errno = r_errno;
