@@ -52,6 +52,14 @@ class CommandTransaction
 public:
   uint16_t expected_command;
   std::promise<uint8_t> promise;
+  //! Guard against duplicate COMMAND_ACKs: the transaction lives in
+  //! ack_waiting_list from the moment the first ACK satisfies the promise
+  //! until the waiter re-locks and erases it. A second ACK for the same
+  //! command arriving in that window would call promise.set_value() twice and
+  //! throw std::future_error ("Promise already satisfied"), which is uncaught
+  //! in the message handler and aborts mavros_node. FCUs (ArduPilot) and an
+  //! active GCS both retransmit ACKs, so this is a real race.
+  bool fulfilled{false};
 
   explicit CommandTransaction(uint16_t command)
   :    expected_command(command)
@@ -193,7 +201,13 @@ private:
 
     for (auto & tr : ack_waiting_list) {
       if (tr.expected_command == ack.command) {
-        tr.promise.set_value(ack.result);
+        // First ACK satisfies the waiter; later duplicates for the same
+        // still-pending command are matched here and dropped, never
+        // re-satisfying the promise (which would throw and abort the node).
+        if (!tr.fulfilled) {
+          tr.fulfilled = true;
+          tr.promise.set_value(ack.result);
+        }
         return;
       }
     }
