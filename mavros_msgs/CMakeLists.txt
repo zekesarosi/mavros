@@ -31,6 +31,7 @@ set(msg_files
   # [[[cog:
   # mavros_cog.outl_glob_files('msg', '*.msg')
   # ]]]
+  msg/ADSBTransceiverHealthReport.msg
   msg/ADSBVehicle.msg
   msg/ActuatorControl.msg
   msg/Altitude.msg
