@@ -10,14 +10,19 @@
       {
         "name": "~/vehicle",
         "type_name": "mavros_msgs::msg::ADSBVehicle",
-        "line": 46
+        "line": 47
+      },
+      {
+        "name": "~/transceiver_health",
+        "type_name": "mavros_msgs::msg::ADSBTransceiverHealthReport",
+        "line": 49
       }
     ],
     "subscribers": [
       {
         "name": "~/send",
         "type_name": "mavros_msgs::msg::ADSBVehicle",
-        "line": 48
+        "line": 52
       }
     ],
     "services": [],
@@ -30,8 +35,17 @@
         "message_name": "ADSB_VEHICLE",
         "msg_id_expr": "mavlink::common::msg::ADSB_VEHICLE::MSG_ID",
         "dialect": "common",
-        "line": 56,
+        "line": 60,
         "msg_id": 246
+      },
+      {
+        "handler": "handle_transceiver_health_report",
+        "message_type": "mavlink::uAvionix::msg::UAVIONIX_ADSB_TRANSCEIVER_HEALTH_REPORT",
+        "message_name": "UAVIONIX_ADSB_TRANSCEIVER_HEALTH_REPORT",
+        "msg_id_expr": "mavlink::uAvionix::msg::UAVIONIX_ADSB_TRANSCEIVER_HEALTH_REPORT::MSG_ID",
+        "dialect": "uAvionix",
+        "line": 61,
+        "msg_id": 10003
       }
     ],
     "mavlink_publications": [
@@ -41,7 +55,7 @@
         "message_name": "ADSB_VEHICLE",
         "msg_id_expr": "mavlink::common::msg::ADSB_VEHICLE::MSG_ID",
         "dialect": "common",
-        "line": 164,
+        "line": 190,
         "msg_id": 246
       }
     ]
