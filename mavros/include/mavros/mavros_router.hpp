@@ -111,6 +111,12 @@ public:
 
   virtual std::string diag_name();
   virtual void diag_run(diagnostic_updater::DiagnosticStatusWrapper & stat) = 0;
+
+protected:
+  // Returns a copy of remote_addrs taken under the router mutex.
+  // recv_message() mutates remote_addrs on the link I/O thread, so readers
+  // (e.g. diagnostics) must not iterate it lock-free.
+  std::vector<addr_t> snapshot_remote_addrs();
 };
 
 /**

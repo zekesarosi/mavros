@@ -342,22 +342,43 @@ void Endpoint::recv_message(const mavlink_message_t * msg, const Framing framing
   const addr_t sysid_addr = msg->sysid << 8;
   const addr_t sysid_compid_addr = (msg->sysid << 8) | msg->compid;
 
-  // save source addr to remote_addrs
-  auto sp = this->remote_addrs.emplace(sysid_addr);
-  auto scp = this->remote_addrs.emplace(sysid_compid_addr);
-
-  // and delete it from stale_addrs
-  this->stale_addrs.erase(sysid_addr);
-  this->stale_addrs.erase(sysid_compid_addr);
-
   auto & nh = this->parent;
-  if (sp.second || scp.second) {
+
+  // NOTE(astra): recv_message runs on the link I/O thread (libmavconn asio for
+  // MAVConnEndpoint, executor callback for ROSEndpoint), concurrently with
+  // Router::route_message and Router::periodic_clear_stale_remote_addrs which
+  // touch these same sets under Router::mu. Mutating remote_addrs/stale_addrs
+  // here without the lock is a data race that corrupts the std::set tree (and
+  // thus the heap), so guard them with the router mutex. The lock is scoped so
+  // it is released before route_message(), which takes shared_lock(mu) itself
+  // (the shared_timed_mutex is not recursive).
+  bool is_new_remote = false;
+  {
+    unique_lock lock(nh->mu);
+
+    // save source addr to remote_addrs
+    auto sp = this->remote_addrs.emplace(sysid_addr);
+    auto scp = this->remote_addrs.emplace(sysid_compid_addr);
+    is_new_remote = sp.second || scp.second;
+
+    // and delete it from stale_addrs
+    this->stale_addrs.erase(sysid_addr);
+    this->stale_addrs.erase(sysid_compid_addr);
+  }
+
+  if (is_new_remote) {
     RCLCPP_INFO(
       nh->get_logger(), "link[%d] detected remote address %d.%d", this->id, msg->sysid,
       msg->compid);
   }
 
   nh->route_message(shared_from_this(), msg, framing);
+}
+
+std::vector<addr_t> Endpoint::snapshot_remote_addrs()
+{
+  shared_lock lock(this->parent->mu);
+  return std::vector<addr_t>(this->remote_addrs.begin(), this->remote_addrs.end());
 }
 
 std::string Endpoint::diag_name()
@@ -439,9 +460,10 @@ void MAVConnEndpoint::diag_run(diagnostic_updater::DiagnosticStatusWrapper & sta
   stat.addf("Rx speed", "%f", iostat.rx_speed);
   stat.addf("Tx speed", "%f", iostat.tx_speed);
 
-  stat.addf("Remotes count", "%zu", this->remote_addrs.size());
+  auto remotes = this->snapshot_remote_addrs();
+  stat.addf("Remotes count", "%zu", remotes.size());
   size_t idx = 0;
-  for (auto addr : this->remote_addrs) {
+  for (auto addr : remotes) {
     stat.addf(utils::format("Remote [%d]", idx++), "%d.%d", addr >> 8, addr & 0xff);
   }
 
@@ -534,9 +556,10 @@ void ROSEndpoint::diag_run(diagnostic_updater::DiagnosticStatusWrapper & stat)
 {
   // TODO(vooon): make some diagnostics
 
-  stat.addf("Remotes count", "%zu", this->remote_addrs.size());
+  auto remotes = this->snapshot_remote_addrs();
+  stat.addf("Remotes count", "%zu", remotes.size());
   size_t idx = 0;
-  for (auto addr : this->remote_addrs) {
+  for (auto addr : remotes) {
     stat.addf(utils::format("Remote [%d]", idx++), "%d.%d", addr >> 8, addr & 0xff);
   }
 
