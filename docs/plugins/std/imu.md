@@ -8,6 +8,7 @@
 
 ## Publishers
 - `~/data` ([sensor_msgs::msg::Imu](https://docs.ros.org/en/rolling/p/sensor_msgs/msg/Imu.html))
+- `~/euler` ([geometry_msgs::msg::Vector3Stamped](https://docs.ros.org/en/rolling/p/geometry_msgs/msg/Vector3Stamped.html)) — roll, pitch, yaw in radians (`vector.x/y/z`), aircraft to NED. Same estimate as MAVLink `ATTITUDE`, not the ENU/`base_link` quaternion on `~/data`.
 - `~/data_raw` ([sensor_msgs::msg::Imu](https://docs.ros.org/en/rolling/p/sensor_msgs/msg/Imu.html))
 - `~/mag` ([sensor_msgs::msg::MagneticField](https://docs.ros.org/en/rolling/p/sensor_msgs/msg/MagneticField.html))
 - `~/temperature_imu` ([sensor_msgs::msg::Temperature](https://docs.ros.org/en/rolling/p/sensor_msgs/msg/Temperature.html))

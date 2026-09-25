@@ -799,7 +799,12 @@
       {
         "name": "~/data",
         "type_name": "sensor_msgs::msg::Imu",
-        "line": 111
+        "line": 112
+      },
+      {
+        "name": "~/euler",
+        "type_name": "geometry_msgs::msg::Vector3Stamped",
+        "line": 114
       },
       {
         "name": "~/data_raw",
