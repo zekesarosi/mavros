@@ -14,11 +14,15 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
+#include <atomic>
+#include <chrono>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "rclcpp/executors.hpp"
 #include "mavconn/interface.hpp"
@@ -138,8 +142,10 @@ public:
   std::function<void()> take_callback(const std::shared_ptr<TimerT> & timer)
   {
     timer->reset();
-    // Humble executes timers directly; newer rclcpp separates take and execute.
-    if constexpr (requires {timer->call();}) {
+    // Humble: call() returns bool and execute_callback() takes no arguments.
+    // Newer rclcpp: call() returns the call info that execute_callback() consumes.
+    // Probe the execute_callback() signature, since call() exists on both.
+    if constexpr (requires(std::shared_ptr<void> data) {timer->execute_callback(data);}) {
       auto data = timer->call();
       return [timer, data]() {timer->execute_callback(data);};
     } else {
@@ -171,6 +177,18 @@ public:
   void plugin_route(MockUAS::SharedPtr p, const mavlink_message_t * msg, const Framing framing)
   {
     p->plugin_route(msg, framing);
+  }
+
+  void recv_message(MockUAS::SharedPtr p, const mavlink_message_t & msg, const Framing framing)
+  {
+    auto rmsg = std::make_unique<mavros_msgs::msg::Mavlink>();
+    ASSERT_TRUE(mavros_msgs::mavlink::convert(msg, *rmsg, utils::enum_value(framing)));
+    p->recv_message(std::move(rmsg));
+  }
+
+  static bool is_fast_lane_msgid(uint32_t msgid)
+  {
+    return UAS::is_fast_lane_msgid(msgid);
   }
 
   mavlink_message_t convert_message(const mavlink::Message & msg, const uint16_t source = 0x0101)
@@ -382,6 +400,119 @@ TEST_F(TestUAS, synchronise_stamp_out_of_range_falls_back_to_now)
   EXPECT_NEAR(
     uas->synchronise_stamp(std::numeric_limits<uint64_t>::max()).seconds(),
     uas->now().seconds(), 1.0);
+}
+
+TEST_F(TestUAS, fast_lane_bypasses_bulk_queue_and_concurrent_send)
+{
+  EXPECT_TRUE(is_fast_lane_msgid(mavlink::common::msg::SYSTEM_TIME::MSG_ID));
+  EXPECT_TRUE(is_fast_lane_msgid(mavlink::common::msg::ATTITUDE::MSG_ID));
+  EXPECT_TRUE(is_fast_lane_msgid(mavlink::common::msg::ATTITUDE_QUATERNION::MSG_ID));
+  EXPECT_TRUE(is_fast_lane_msgid(mavlink::common::msg::LOCAL_POSITION_NED::MSG_ID));
+  EXPECT_TRUE(is_fast_lane_msgid(mavlink::common::msg::LOCAL_POSITION_NED_COV::MSG_ID));
+  EXPECT_TRUE(is_fast_lane_msgid(mavlink::common::msg::COMMAND_ACK::MSG_ID));
+  EXPECT_TRUE(is_fast_lane_msgid(mavlink::common::msg::TIMESYNC::MSG_ID));
+  EXPECT_TRUE(is_fast_lane_msgid(mavlink::common::msg::ODOMETRY::MSG_ID));
+  EXPECT_FALSE(is_fast_lane_msgid(mavlink::common::msg::HEARTBEAT::MSG_ID));
+  EXPECT_FALSE(is_fast_lane_msgid(mavlink::common::msg::STATUSTEXT::MSG_ID));
+  EXPECT_FALSE(is_fast_lane_msgid(mavlink::common::msg::PARAM_VALUE::MSG_ID));
+
+  class LanePlugin : public plugin::Plugin
+  {
+  public:
+    explicit LanePlugin(UAS::SharedPtr uas_)
+    : Plugin(uas_.get()) {}
+
+    Subscriptions get_subscriptions() override
+    {
+      return {
+        make_handler(mavlink::common::msg::LOCAL_POSITION_NED::MSG_ID, &LanePlugin::on_fast),
+        make_handler(mavlink::common::msg::STATUSTEXT::MSG_ID, &LanePlugin::on_bulk),
+      };
+    }
+
+    void on_fast(const mavlink_message_t *, const Framing)
+    {
+      fast_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void on_bulk(const mavlink_message_t *, const Framing)
+    {
+      if (!first_bulk_entered.exchange(true)) {
+        while (!release_bulk.load(std::memory_order_acquire)) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+      }
+      bulk_count.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::atomic<size_t> fast_count{0};
+    std::atomic<size_t> bulk_count{0};
+    std::atomic<bool> first_bulk_entered{false};
+    std::atomic<bool> release_bulk{false};
+  };
+
+  auto uas = create_node();
+  auto lane_plugin = std::make_shared<LanePlugin>(uas);
+  testing::Mock::AllowLeak(&(*uas));
+
+  uas->set_parameter(rclcpp::Parameter("plugin_allowlist", UAS::StrV{"lane_test"}));
+  uas->set_parameter(rclcpp::Parameter("rt_sched_fifo_priority", 0));
+  EXPECT_CALL(*uas, create_plugin_instance("lane_test")).WillRepeatedly(Return(lane_plugin));
+  auto startup_cb = take_startup_callback(uas);
+  startup_cb();
+  add_plugin(uas, "lane_test");
+
+  mavlink::common::msg::STATUSTEXT stxt{};
+  auto m_bulk = convert_message(stxt, 0x0101);
+  mavlink::common::msg::LOCAL_POSITION_NED lpn{};
+  auto m_fast = convert_message(lpn, 0x0101);
+
+  // Enqueue one bulk message and wait until the bulk worker enters the handler and blocks.
+  recv_message(uas, m_bulk, Framing::ok);
+  const auto enter_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!lane_plugin->first_bulk_entered.load(std::memory_order_acquire) &&
+    std::chrono::steady_clock::now() < enter_deadline)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  ASSERT_TRUE(lane_plugin->first_bulk_entered.load());
+
+  // Flood bulk queue beyond capacity while bulk worker is blocked, and concurrently send outbound
+  // frames from multiple threads.
+  std::vector<std::thread> senders;
+  for (int t = 0; t < 4; ++t) {
+    senders.emplace_back([&]() {
+      auto hb = make_heartbeat();
+      for (int i = 0; i < 50; ++i) {
+        uas->send_message(hb);
+      }
+    });
+  }
+  for (int i = 0; i < 1200; ++i) {
+    recv_message(uas, m_bulk, Framing::ok);
+  }
+
+  // Fast-lane messages must execute immediately on the caller without waiting for bulk_rx_thd.
+  for (int i = 0; i < 50; ++i) {
+    recv_message(uas, m_fast, Framing::ok);
+  }
+  EXPECT_EQ(lane_plugin->fast_count.load(), 50U);
+  EXPECT_EQ(lane_plugin->bulk_count.load(), 0U);
+
+  // Release bulk worker and join concurrent senders.
+  lane_plugin->release_bulk.store(true, std::memory_order_release);
+  for (auto & th : senders) {
+    th.join();
+  }
+
+  const auto drain_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (lane_plugin->bulk_count.load() < 1025U &&
+    std::chrono::steady_clock::now() < drain_deadline)
+  {
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+  // 1 in-flight + 1024 queued max capacity.
+  EXPECT_EQ(lane_plugin->bulk_count.load(), 1025U);
 }
 
 }  // namespace uas
