@@ -67,6 +67,7 @@ UAS::UAS(
   rt_sched_fifo_priority(10),
   source_cb_group(this->create_callback_group(
       rclcpp::CallbackGroupType::MutuallyExclusive, false)),
+  bulk_rx_ring(kMaxBulkRxQueueSize),
   plugin_factory_loader("mavros", "mavros::plugin::PluginFactory"),
   loaded_plugins{},
   plugin_subscriptions{},
@@ -140,26 +141,6 @@ void UAS::startup()
 
   source_exec.add_callback_group(source_cb_group, this->get_node_base_interface());
 
-  exec_spin_thd = thread_ptr(
-    new std::thread(
-      [this]() {
-        utils::set_this_thread_name("uas-exec/%d.%d", source_system, source_component);
-        auto lg = this->get_logger();
-
-        RCLCPP_INFO(
-          lg, "UAS Executor started, threads: %zu",
-          this->exec.get_number_of_threads());
-        this->exec.spin();
-        RCLCPP_WARN(lg, "UAS Executor terminated");
-      }),
-    [this](std::thread * t) {
-      this->exec.cancel();
-      if (t->joinable()) {
-        t->join();
-      }
-      delete t;
-    });
-
   // setup diag
   diagnostic_updater.setHardwareID(utils::format("uas://%s", uas_url.c_str()));
   diagnostic_updater.add("MAVROS UAS", this, &UAS::diag_run);
@@ -225,6 +206,26 @@ void UAS::startup()
 
   connect_to_router();
 
+  exec_spin_thd = thread_ptr(
+    new std::thread(
+      [this]() {
+        utils::set_this_thread_name("uas-exec/%d.%d", source_system, source_component);
+        auto lg = this->get_logger();
+
+        RCLCPP_INFO(
+          lg, "UAS Executor started, threads: %zu",
+          this->exec.get_number_of_threads());
+        this->exec.spin();
+        RCLCPP_WARN(lg, "UAS Executor terminated");
+      }),
+    [this](std::thread * t) {
+      this->exec.cancel();
+      if (t->joinable()) {
+        t->join();
+      }
+      delete t;
+    });
+
   bulk_rx_thd = thread_ptr(
     new std::thread(
       [this]() {
@@ -287,6 +288,9 @@ void UAS::startup()
 
 UAS::~UAS()
 {
+  if (startup_delay_timer) {
+    startup_delay_timer->cancel();
+  }
   // Stop the executors and bulk worker before plugin nodes and subscriptions begin tearing down.
   source_spin_thd.reset();
   bulk_rx_thd.reset();
@@ -301,7 +305,17 @@ void UAS::plugin_route(const mavlink_message_t * mmsg, const Framing framing)
   }
 
   for (auto & info : it->second) {
-    std::get<3>(info)(mmsg, framing);
+    try {
+      std::get<3>(info)(mmsg, framing);
+    } catch (const std::exception & ex) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "UAS: exception in handler for msgid %u: %s", mmsg->msgid, ex.what());
+    } catch (...) {
+      RCLCPP_ERROR_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "UAS: unknown exception in handler for msgid %u", mmsg->msgid);
+    }
   }
 }
 
@@ -506,13 +520,14 @@ void UAS::bulk_rx_loop()
     {
       std::unique_lock<std::mutex> lock(bulk_rx_mutex);
       bulk_rx_cv.wait(lock, [this]() {
-        return bulk_rx_stop || !bulk_rx_queue.empty();
+        return bulk_rx_stop || bulk_rx_count > 0;
       });
-      if (bulk_rx_stop && bulk_rx_queue.empty()) {
+      if (bulk_rx_stop && bulk_rx_count == 0) {
         return;
       }
-      item = bulk_rx_queue.front();
-      bulk_rx_queue.pop_front();
+      item = bulk_rx_ring[bulk_rx_head];
+      bulk_rx_head = (bulk_rx_head + 1) % kMaxBulkRxQueueSize;
+      bulk_rx_count--;
     }
     plugin_route(&item.msg, item.framing);
   }
@@ -520,12 +535,15 @@ void UAS::bulk_rx_loop()
 
 void UAS::recv_message(mavros_msgs::msg::Mavlink::UniquePtr rmsg)
 {
+  if (!rmsg) {
+    return;
+  }
   mavlink::mavlink_message_t msg;
 
   auto ok = mavros_msgs::mavlink::convert(*rmsg, msg);
-  rcpputils::assert_true(ok, "conversion error");
-
   if (!ok) {
+    RCLCPP_ERROR_THROTTLE(
+      get_logger(), *get_clock(), 1000, "UAS: message conversion error");
     return;
   }
 
@@ -535,12 +553,20 @@ void UAS::recv_message(mavros_msgs::msg::Mavlink::UniquePtr rmsg)
     return;
   }
 
+  bool dropped = false;
   {
     std::lock_guard<std::mutex> lock(bulk_rx_mutex);
-    if (bulk_rx_queue.size() >= kMaxBulkRxQueueSize) {
-      bulk_rx_queue.pop_front();
+    if (bulk_rx_count >= kMaxBulkRxQueueSize) {
+      bulk_rx_head = (bulk_rx_head + 1) % kMaxBulkRxQueueSize;
+      bulk_rx_count--;
+      dropped = true;
     }
-    bulk_rx_queue.push_back(BulkRxItem{msg, framing});
+    bulk_rx_ring[bulk_rx_tail] = BulkRxItem{msg, framing};
+    bulk_rx_tail = (bulk_rx_tail + 1) % kMaxBulkRxQueueSize;
+    bulk_rx_count++;
+  }
+  if (dropped) {
+    bulk_rx_drops.fetch_add(1, std::memory_order_relaxed);
   }
   bulk_rx_cv.notify_one();
 }

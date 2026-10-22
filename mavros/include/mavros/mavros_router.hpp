@@ -235,7 +235,16 @@ public:
             "mudp-io: SCHED_FIFO(prio=%d) failed (%s); normal scheduling",
             rt_prio, std::strerror(errno));
         }
-        this->router_io_runner.io().run();
+        for (;;) {
+          try {
+            this->router_io_runner.io().run();
+            break;
+          } catch (const std::exception & ex) {
+            RCLCPP_ERROR(this->get_logger(), "mudp-io: exception in io_context: %s", ex.what());
+          } catch (...) {
+            RCLCPP_ERROR(this->get_logger(), "mudp-io: unknown exception in io_context");
+          }
+        }
       });
 
     // Delay parameter callback initialization so that endpoints are not

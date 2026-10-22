@@ -479,6 +479,7 @@ private:
     FTPRequest & req,
     plugin::filter::SystemAndOk filter [[maybe_unused]])
   {
+    std::lock_guard<std::mutex> lock(cond_mutex);
     try {
       dispatch_file_transfer_protocol(req);
     } catch (const std::exception & ex) {
@@ -506,14 +507,29 @@ private:
     }
 
     const auto hdr = req.header();
+    if (hdr.size > FTPRequest::DATA_MAXSZ) {
+      RCLCPP_ERROR(
+        get_logger(),
+        "FTP: packet payload size %u exceeds DATA_MAXSZ %u; resetting",
+        hdr.size, FTPRequest::DATA_MAXSZ);
+      go_idle(true, EBADMSG);
+      return;
+    }
+
     const uint16_t incoming_seqnr = hdr.seqNumber;
     const uint16_t expected_seqnr = last_send_seqnr + 1;
+    if (op_state != OP::READ && hdr.req_opcode == FTPRequest::kCmdBurstReadFile) {
+      RCLCPP_DEBUG(
+        get_logger(), "FTP: ignoring stale burst-read packet (seqnr=%u) in state=%u",
+        incoming_seqnr, enum_value(op_state));
+      return;
+    }
     if (incoming_seqnr != expected_seqnr) {
       if (op_state != OP::READ) {
         RCLCPP_WARN_THROTTLE(
-          get_logger(), *get_clock(), 1000, "FTP: Lost sync! seqnr: %u != %u",
-          incoming_seqnr, expected_seqnr);
-        go_idle(true, EILSEQ);
+          get_logger(), *get_clock(), 1000,
+          "FTP: ignoring out-of-sync packet (seqnr: %u != %u, req_opcode=%u, state=%u)",
+          incoming_seqnr, expected_seqnr, hdr.req_opcode, enum_value(op_state));
         return;
       }
     }
@@ -646,7 +662,7 @@ private:
       return;
     }
 
-    uint8_t off = 0;
+    size_t off = 0;
     uint32_t n_list_entries = 0;
 
     while (off < hdr.size) {
@@ -657,7 +673,7 @@ private:
       if (slen == bytes_left) {
         RCLCPP_WARN(
           get_logger(),
-          "FTP:List: missing NUL termination at offset %u of %u; truncating chunk",
+          "FTP:List: missing NUL termination at offset %zu of %u; truncating chunk",
           off, hdr.size);
         break;
       }
@@ -672,7 +688,7 @@ private:
       {
         RCLCPP_WARN(
           get_logger(),
-          "FTP:List: skipping malformed entry at offset %u (type='%c' slen=%zu)",
+          "FTP:List: skipping malformed entry at offset %zu (type='%c' slen=%zu)",
           off, ptr[0] ? ptr[0] : '?', slen);
         off += slen + 1;
         continue;
@@ -1227,10 +1243,8 @@ private:
       FTPRequest::DATA_MAXSZ);
   }
 
-  bool wait_completion(const int msecs)
+  bool wait_completion(std::unique_lock<std::mutex> & lock, const int msecs)
   {
-    std::unique_lock<std::mutex> lock(cond_mutex);
-
     uint32_t last_progress = rx_progress.load(std::memory_order_relaxed);
     for (;;) {
       if (op_state == OP::IDLE) {
@@ -1255,6 +1269,8 @@ private:
       }
 
       op_state = OP::IDLE;
+      burst_resync_pending = false;
+      burst_draining = false;
       r_errno = ETIMEDOUT;
       return false;
     }
@@ -1266,6 +1282,7 @@ private:
    * Service handler common header code.
    */
 #define SERVICE_IDLE_CHECK_OR_BUSY(res) \
+  std::unique_lock<std::mutex> lock(cond_mutex); \
   do { \
     if (op_state != OP::IDLE) { \
       RCLCPP_WARN( \
@@ -1284,7 +1301,7 @@ private:
     SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     list_directory(req->dir_path);
-    res->success = wait_completion(LIST_TIMEOUT_MS);
+    res->success = wait_completion(lock, LIST_TIMEOUT_MS);
     res->r_errno = r_errno;
     if (res->success) {
       res->list = std::move(list_entries);
@@ -1311,7 +1328,7 @@ private:
 
     res->success = open_file(req->file_path, req->mode);
     if (res->success) {
-      res->success = wait_completion(OPEN_TIMEOUT_MS);
+      res->success = wait_completion(lock, OPEN_TIMEOUT_MS);
       res->size = open_size;
     }
     res->r_errno = r_errno;
@@ -1325,7 +1342,7 @@ private:
 
     res->success = close_file(req->file_path);
     if (res->success) {
-      res->success = wait_completion(OPEN_TIMEOUT_MS);
+      res->success = wait_completion(lock, OPEN_TIMEOUT_MS);
     }
     res->r_errno = r_errno;
   }
@@ -1338,7 +1355,7 @@ private:
 
     res->success = read_file(req->file_path, req->offset, req->size);
     if (res->success) {
-      res->success = wait_completion(CHUNK_TIMEOUT_MS);
+      res->success = wait_completion(lock, CHUNK_TIMEOUT_MS);
     }
     if (res->success) {
       res->data = std::move(read_buffer);
@@ -1355,7 +1372,7 @@ private:
 
     res->success = write_file(req->file_path, req->offset, req->data);
     if (res->success) {
-      res->success = wait_completion(CHUNK_TIMEOUT_MS);
+      res->success = wait_completion(lock, CHUNK_TIMEOUT_MS);
     }
     write_buffer.clear();
     res->r_errno = r_errno;
@@ -1368,7 +1385,7 @@ private:
     SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     remove_file(req->file_path);
-    res->success = wait_completion(OPEN_TIMEOUT_MS);
+    res->success = wait_completion(lock, OPEN_TIMEOUT_MS);
     res->r_errno = r_errno;
   }
 
@@ -1380,7 +1397,7 @@ private:
 
     res->success = rename_(req->old_path, req->new_path);
     if (res->success) {
-      res->success = wait_completion(OPEN_TIMEOUT_MS);
+      res->success = wait_completion(lock, OPEN_TIMEOUT_MS);
     }
     res->r_errno = r_errno;
   }
@@ -1393,7 +1410,7 @@ private:
 
     // Note: emulated truncate() can take a while
     truncate_file(req->file_path, req->length);
-    res->success = wait_completion(LIST_TIMEOUT_MS * 5);
+    res->success = wait_completion(lock, LIST_TIMEOUT_MS * 5);
     res->r_errno = r_errno;
   }
 
@@ -1404,7 +1421,7 @@ private:
     SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     create_directory(req->dir_path);
-    res->success = wait_completion(OPEN_TIMEOUT_MS);
+    res->success = wait_completion(lock, OPEN_TIMEOUT_MS);
     res->r_errno = r_errno;
   }
 
@@ -1415,7 +1432,7 @@ private:
     SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     remove_directory(req->dir_path);
-    res->success = wait_completion(OPEN_TIMEOUT_MS);
+    res->success = wait_completion(lock, OPEN_TIMEOUT_MS);
     res->r_errno = r_errno;
   }
 
@@ -1426,7 +1443,7 @@ private:
     SERVICE_IDLE_CHECK_OR_BUSY(res);
 
     checksum_crc32_file(req->file_path);
-    res->success = wait_completion(LIST_TIMEOUT_MS);
+    res->success = wait_completion(lock, LIST_TIMEOUT_MS);
     res->crc32 = checksum_crc32;
     res->r_errno = r_errno;
   }
@@ -1441,9 +1458,10 @@ private:
     const std_srvs::srv::Empty::Request::SharedPtr req [[maybe_unused]],
     std_srvs::srv::Empty::Response::SharedPtr res [[maybe_unused]])
   {
+    std::unique_lock<std::mutex> lock(cond_mutex);
     send_reset();
     session_file_map.clear();
-    wait_completion(OPEN_TIMEOUT_MS);
+    wait_completion(lock, OPEN_TIMEOUT_MS);
   }
 };
 

@@ -673,7 +673,11 @@ private:
   static constexpr size_t kMaxBulkRxQueueSize = 1024;
   std::mutex bulk_rx_mutex;
   std::condition_variable bulk_rx_cv;
-  std::deque<BulkRxItem> bulk_rx_queue;
+  std::vector<BulkRxItem> bulk_rx_ring;
+  size_t bulk_rx_head{0};
+  size_t bulk_rx_tail{0};
+  size_t bulk_rx_count{0};
+  std::atomic<size_t> bulk_rx_drops{0};
   bool bulk_rx_stop{false};
   thread_ptr bulk_rx_thd;
 
@@ -698,7 +702,7 @@ private:
   std::vector<CapabilitiesCb> capabilities_cb_vec;
 
   std::atomic<int64_t> time_offset;
-  timesync_mode tsync_mode;
+  std::atomic<timesync_mode> tsync_mode;
 
   // UAS -> Router connection
   std::mutex send_mutex;

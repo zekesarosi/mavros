@@ -186,6 +186,11 @@ public:
     p->recv_message(std::move(rmsg));
   }
 
+  void recv_raw_ros_message(MockUAS::SharedPtr p, mavros_msgs::msg::Mavlink::UniquePtr rmsg)
+  {
+    p->recv_message(std::move(rmsg));
+  }
+
   static bool is_fast_lane_msgid(uint32_t msgid)
   {
     return UAS::is_fast_lane_msgid(msgid);
@@ -513,6 +518,133 @@ TEST_F(TestUAS, fast_lane_bypasses_bulk_queue_and_concurrent_send)
   }
   // 1 in-flight + 1024 queued max capacity.
   EXPECT_EQ(lane_plugin->bulk_count.load(), 1025U);
+
+  // Malformed Mavlink ROS message (invalid signature size != 13) must be dropped without throwing.
+  auto bad_rmsg = std::make_unique<mavros_msgs::msg::Mavlink>();
+  bad_rmsg->signature.resize(5, 0);
+  EXPECT_NO_THROW(recv_raw_ros_message(uas, std::move(bad_rmsg)));
+  EXPECT_NO_THROW(recv_raw_ros_message(uas, nullptr));
+}
+
+TEST_F(TestUAS, stress_concurrent_fast_bulk_exception_and_state_transitions)
+{
+  class StressPlugin : public plugin::Plugin
+  {
+  public:
+    explicit StressPlugin(UAS::SharedPtr uas_)
+    : Plugin(uas_.get())
+    {
+      enable_connection_cb();
+      enable_capabilities_cb();
+    }
+
+    Subscriptions get_subscriptions() override
+    {
+      return {
+        make_handler(mavlink::common::msg::ATTITUDE::MSG_ID, &StressPlugin::on_fast_att),
+        make_handler(mavlink::common::msg::LOCAL_POSITION_NED::MSG_ID, &StressPlugin::on_fast_lpn),
+        make_handler(mavlink::common::msg::HEARTBEAT::MSG_ID, &StressPlugin::on_bulk_hb),
+        make_handler(mavlink::common::msg::DEBUG::MSG_ID, &StressPlugin::on_throwing),
+      };
+    }
+
+    void on_fast_att(const mavlink_message_t *, const Framing)
+    {
+      fast_att.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void on_fast_lpn(const mavlink_message_t *, const Framing)
+    {
+      fast_lpn.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void on_bulk_hb(const mavlink_message_t *, const Framing)
+    {
+      bulk_hb.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void on_throwing(const mavlink_message_t *, const Framing)
+    {
+      throw_calls.fetch_add(1, std::memory_order_relaxed);
+      throw std::runtime_error("simulated plugin handler failure");
+    }
+
+    void connection_cb(bool) override
+    {
+      conn_transitions.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void capabilities_cb(uas::MAV_CAP) override
+    {
+      cap_transitions.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    std::atomic<size_t> fast_att{0};
+    std::atomic<size_t> fast_lpn{0};
+    std::atomic<size_t> bulk_hb{0};
+    std::atomic<size_t> throw_calls{0};
+    std::atomic<size_t> conn_transitions{0};
+    std::atomic<size_t> cap_transitions{0};
+  };
+
+  auto uas = create_node();
+  auto sp = std::make_shared<StressPlugin>(uas);
+  testing::Mock::AllowLeak(&(*uas));
+
+  uas->set_parameter(rclcpp::Parameter("plugin_allowlist", UAS::StrV{"stress_test"}));
+  uas->set_parameter(rclcpp::Parameter("rt_sched_fifo_priority", 0));
+  EXPECT_CALL(*uas, create_plugin_instance("stress_test")).WillRepeatedly(Return(sp));
+  auto startup_cb = take_startup_callback(uas);
+  startup_cb();
+  add_plugin(uas, "stress_test");
+
+  mavlink::common::msg::ATTITUDE att{};
+  auto m_att = convert_message(att, 0x0101);
+  mavlink::common::msg::LOCAL_POSITION_NED lpn{};
+  auto m_lpn = convert_message(lpn, 0x0101);
+  auto hb = make_heartbeat();
+  auto m_hb = convert_message(hb, 0x0101);
+  mavlink::common::msg::DEBUG dbg{};
+  auto m_dbg = convert_message(dbg, 0x0101);
+
+  constexpr int kThreads = 6;
+  constexpr int kIters = 300;
+  std::vector<std::thread> workers;
+  for (int t = 0; t < kThreads; ++t) {
+    workers.emplace_back([&, t]() {
+      for (int i = 0; i < kIters; ++i) {
+        recv_message(uas, m_att, Framing::ok);
+        recv_message(uas, m_lpn, Framing::ok);
+        recv_message(uas, m_hb, Framing::ok);
+        if ((i % 10) == 0) {
+          recv_message(uas, m_dbg, Framing::ok);
+        }
+        if ((i % 25) == 0) {
+          uas->send_message(hb, static_cast<uint8_t>(190 + t));
+          uas->update_connection_status((i % 50) == 0);
+          uas->update_capabilities(true, static_cast<uint64_t>(i + 1));
+          (void)uas->synchronise_stamp(static_cast<uint32_t>(i * 10));
+        }
+      }
+    });
+  }
+
+  for (auto & w : workers) {
+    w.join();
+  }
+
+  EXPECT_EQ(sp->fast_att.load(), static_cast<size_t>(kThreads * kIters));
+  EXPECT_EQ(sp->fast_lpn.load(), static_cast<size_t>(kThreads * kIters));
+
+  // Wait for bulk queue to drain.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (sp->throw_calls.load() == 0 && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+  }
+  EXPECT_GT(sp->bulk_hb.load(), 0U);
+  EXPECT_GT(sp->throw_calls.load(), 0U);
+  EXPECT_GT(sp->conn_transitions.load(), 0U);
+  EXPECT_GT(sp->cap_transitions.load(), 0U);
 }
 
 }  // namespace uas
