@@ -87,10 +87,10 @@ inline bool convert(const Mavlink & rmsg, mavlink_message_t & mmsg)
   // [[[end]]] (sum: C2bw/BzUbb)
   std::fill(
     std::copy(rmsg.payload64.begin(), rmsg.payload64.end(), mmsg.payload64),
-    std::end(mmsg.payload64), 0);
+    mmsg.payload64 + sizeof(mmsg.payload64) / sizeof(mmsg.payload64[0]), 0);
   std::fill(
     std::copy(rmsg.signature.begin(), rmsg.signature.end(), mmsg.signature),
-    std::end(mmsg.signature), 0);
+    mmsg.signature + sizeof(mmsg.signature) / sizeof(mmsg.signature[0]), 0);
 
   return true;
 }
