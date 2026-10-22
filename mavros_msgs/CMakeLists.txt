@@ -31,6 +31,7 @@ set(msg_files
   # [[[cog:
   # mavros_cog.outl_glob_files('msg', '*.msg')
   # ]]]
+  msg/ADSBTransceiverHealthReport.msg
   msg/ADSBVehicle.msg
   msg/ActuatorControl.msg
   msg/Altitude.msg
@@ -41,6 +42,7 @@ set(msg_files
   msg/CommandCode.msg
   msg/CompanionProcessStatus.msg
   msg/DebugValue.msg
+  msg/EKFStatusReport.msg
   msg/ESCInfo.msg
   msg/ESCInfoItem.msg
   msg/ESCStatus.msg
@@ -77,6 +79,7 @@ set(msg_files
   msg/NavControllerOutput.msg
   msg/ObstacleDistance3D.msg
   msg/OnboardComputerStatus.msg
+  msg/OpenDroneIDArmStatus.msg
   msg/OpenDroneIDBasicID.msg
   msg/OpenDroneIDOperatorID.msg
   msg/OpenDroneIDSelfID.msg
@@ -113,7 +116,7 @@ set(msg_files
   msg/WaypointList.msg
   msg/WaypointReached.msg
   msg/WheelOdomStamped.msg
-  # [[[end]]] (sum: WNC7AFvjZ5)
+  # [[[end]]]
 )
 
 set(srv_files
@@ -162,12 +165,13 @@ set(srv_files
   srv/SetMode.srv
   srv/StreamRate.srv
   srv/TerrainCheck.srv
+  srv/TerrainGridCheck.srv
   srv/VehicleInfoGet.srv
   srv/WaypointClear.srv
   srv/WaypointPull.srv
   srv/WaypointPush.srv
   srv/WaypointSetCurrent.srv
-  # [[[end]]] (sum: gwjU4eY/S4)
+  # [[[end]]]
 )
 
 rosidl_generate_interfaces(${PROJECT_NAME}

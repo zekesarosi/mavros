@@ -34,6 +34,7 @@ SRTM1_SIZE = SRTM1_SIDE * SRTM1_SIDE * 2
 SRTM3_SIZE = SRTM3_SIDE * SRTM3_SIDE * 2
 
 RADIUS_OF_EARTH = 6378100.0
+DOWNLOAD_RETRY_INTERVAL_SEC = 60.0
 
 # MAVLink TERRAIN_REQUEST grid layout (common.xml §TERRAIN_REQUEST):
 #   The terrain around a position is divided into a GRID_ROWS × GRID_COLS
@@ -106,7 +107,7 @@ class SrtmManager:
 
         self._cache: OrderedDict[int, SrtmTile | None] = OrderedDict()
         self._file_index: dict[str, Path] = {}
-        self._download_failed: set[int] = set()
+        self._download_failed: dict[int, float] = {}
         self._download_pending: set[int] = set()
         self._lock = threading.Lock()
 
@@ -336,8 +337,12 @@ class SrtmManager:
         if self._executor is None:
             return
 
+        now = time.monotonic()
         with self._lock:
-            if key in self._download_failed or key in self._download_pending:
+            if key in self._download_pending:
+                return
+            last_failure = self._download_failed.get(key)
+            if last_failure is not None and (now - last_failure) < DOWNLOAD_RETRY_INTERVAL_SEC:
                 return
             self._download_pending.add(key)
 
@@ -349,10 +354,11 @@ class SrtmManager:
         try:
             if not self._download_tile(lat, lon):
                 with self._lock:
-                    self._download_failed.add(key)
+                    self._download_failed[key] = time.monotonic()
                 return False
             tile = self._load_tile(lat, lon)
             with self._lock:
+                self._download_failed.pop(key, None)
                 self._cache[key] = tile
                 while len(self._cache) > self._max_cache_tiles:
                     self._cache.popitem(last=False)
@@ -360,7 +366,7 @@ class SrtmManager:
         except Exception:
             logger.exception('Unexpected error downloading tile (%d, %d)', lat, lon)
             with self._lock:
-                self._download_failed.add(key)
+                self._download_failed[key] = time.monotonic()
             return False
         finally:
             with self._lock:

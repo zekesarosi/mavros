@@ -1,0 +1,13 @@
+# Batch terrain elevation query over a geographic bounding box.
+# Returns a row-major grid of elevations sampled at uniform lat/lon spacing.
+
+float64 min_latitude    # WGS-84 degrees (south edge)
+float64 min_longitude   # WGS-84 degrees (west edge)
+float64 max_latitude    # WGS-84 degrees (north edge)
+float64 max_longitude   # WGS-84 degrees (east edge)
+float64 resolution_deg  # sample spacing in degrees (e.g. 0.0005 ≈ 55 m)
+---
+bool success
+uint32 rows             # number of latitude samples
+uint32 cols             # number of longitude samples
+float32[] elevations    # row-major (south-to-north, west-to-east), NaN = no data

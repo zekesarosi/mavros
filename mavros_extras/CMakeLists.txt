@@ -110,6 +110,7 @@ add_library(mavros_extras_plugins SHARED
   src/plugins/companion_process_status.cpp
   src/plugins/debug_value.cpp
   src/plugins/distance_sensor.cpp
+  src/plugins/ekf_status.cpp
   src/plugins/esc_status.cpp
   src/plugins/esc_telemetry.cpp
   src/plugins/fake_gps.cpp
@@ -223,6 +224,7 @@ ament_python_install_package(${PROJECT_NAME}
 )
 install(PROGRAMS
   scripts/terrain_server
+  scripts/terrain_tile_server
   DESTINATION lib/${PROJECT_NAME}
 )
 

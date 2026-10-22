@@ -23,6 +23,7 @@ requires-python = ">=3.10"
 
 [project.scripts]
 terrain_server = "mavros_extras.terrain_server.cli:main"
+terrain_tile_server = "mavros_extras.terrain_server.node:main"
 
 [tool.setuptools.packages.find]
 include = ["mavros_extras", "mavros_extras.*"]

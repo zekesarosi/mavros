@@ -114,16 +114,18 @@ if(BUILD_TESTING)
     console_bridge::console_bridge
   )
 
-  find_package(ament_cmake_google_benchmark REQUIRED)
-  # Standalone transport pair benchmark (udp/tcp). Not registered as a CI test:
-  # the async close/shutdown race makes it intermittently hang under the test
-  # harness. Run manually to check for mavconn hot-path regressions:
-  #   build/libmavconn/mavconn-benchmark
-  ament_add_google_benchmark_executable(mavconn-benchmark test/test_mavconn_benchmark.cpp)
-  target_link_libraries(mavconn-benchmark
-    mavconn
-    console_bridge::console_bridge
-  )
+  find_package(ament_cmake_google_benchmark QUIET)
+  if(ament_cmake_google_benchmark_FOUND)
+    # Standalone transport pair benchmark (udp/tcp). Not registered as a CI test:
+    # the async close/shutdown race makes it intermittently hang under the test
+    # harness. Run manually to check for mavconn hot-path regressions:
+    #   build/libmavconn/mavconn-benchmark
+    ament_add_google_benchmark_executable(mavconn-benchmark test/test_mavconn_benchmark.cpp)
+    target_link_libraries(mavconn-benchmark
+      mavconn
+      console_bridge::console_bridge
+    )
+  endif()
 
   # pymavlink-referenced byte-stream e2e test.
   # Small ctypes shim over MAVConnUDP; the pytest skips cleanly when pymavlink
